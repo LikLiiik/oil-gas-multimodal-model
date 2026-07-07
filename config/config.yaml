@@ -1,0 +1,126 @@
+# Oil & Gas Geophysical Large Model Configuration
+# ================================================
+
+# Data Configuration
+data:
+  seismic:
+    volume_shape: [128, 256, 256]  # (D, H, W) - depth, height, width
+    time_samples: 128
+    inline_range: [0, 256]
+    xline_range: [0, 256]
+    sample_interval_ms: 2.0  # ms
+
+  well_log:
+    num_curves: 7  # GR, RT, DEN, POR, AC, SP, CAL
+    curve_names: ["GR", "RT", "DEN", "POR", "AC", "SP", "CAL"]
+    sequence_length: 512
+    depth_interval_m: 0.125  # meters
+
+  batch_size: 8
+  num_workers: 4
+  train_ratio: 0.8
+
+# Model Configuration
+model:
+  # Seismic Encoder
+  seismic_encoder:
+    in_channels: 1
+    stem_channels: 64
+    embed_dim: 192
+    depths: [2, 2, 6, 2]        # Swin block depths per stage
+    num_heads: [4, 8, 16, 32]   # Attention heads per stage
+    window_size: [7, 7, 7]      # 3D window size
+    patch_size: [2, 2, 2]       # 3D patch size
+    mlp_ratio: 4.0
+    dropout: 0.1
+    use_checkpoint: true        # Gradient checkpointing for memory
+
+  # Well Log Encoder
+  well_log_encoder:
+    num_curves: 7
+    stem_channels: [32, 64, 128]  # Multi-scale CNN channels
+    kernel_sizes: [3, 5, 7]       # Multi-scale kernels
+    embed_dim: 192
+    num_layers: 4
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    max_seq_len: 512
+    use_physics_constraint: true   # Enable physics-aware encoding
+
+  # Fusion Module
+  fusion:
+    hidden_dim: 384
+    num_cross_attention_heads: 8
+    num_fusion_layers: 2
+    dropout: 0.1
+    use_gating: true
+
+  # Common
+  hidden_dim: 384
+  output_dim: 256
+
+# Pretraining Configuration
+pretraining:
+  # Masked Seismic Modeling
+  msm:
+    mask_ratio: 0.6
+    mask_block_size: [8, 16, 16]  # (D, H, W)
+    decoder_depth: 4
+    decoder_embed_dim: 128
+    loss_weight: 1.0
+
+  # Masked Well-log Modeling
+  mwm:
+    mask_ratio: 0.5
+    mask_block_size: 16  # consecutive points to mask
+    decoder_layers: 2
+    loss_weight: 1.0
+
+  # Cross-Modal Contrastive Learning
+  cmcl:
+    temperature: 0.07
+    projection_dim: 256
+    loss_weight: 0.5
+
+  # Seismic-Well Matching
+  swm:
+    loss_weight: 0.3
+
+  # Training
+  epochs: 100
+  warmup_epochs: 5
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  scheduler: "cosine"
+
+# Finetuning Configuration
+finetuning:
+  epochs: 50
+  warmup_epochs: 3
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  freeze_encoder_epochs: 5  # Freeze encoder for first N epochs
+
+# Training Configuration
+training:
+  seed: 42
+  device: "cuda"
+  mixed_precision: true       # Use AMP
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 2
+  log_interval: 50
+  save_interval: 5
+  eval_interval: 1
+  early_stopping_patience: 10
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+
+# Loss weights for finetuning
+loss_weights:
+  fault_bce: 0.5
+  fault_dice: 0.5
+  reservoir_mse: 0.6
+  reservoir_ssim: 0.4
+  lithology_ce: 0.7
+  lithology_focal: 0.3
