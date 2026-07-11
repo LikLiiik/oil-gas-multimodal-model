@@ -14,31 +14,62 @@ from pathlib import Path
 @dataclass
 class SeismicEncoderConfig:
     """Configuration for the 3D Seismic Encoder."""
+    # Backbone selection: 'resnet3d', 'swin3d', 'ncs'
+    backbone: str = "ncs"
+
+    # Shared params
     in_channels: int = 1
-    stem_channels: int = 64
     embed_dim: int = 192
-    depths: List[int] = field(default_factory=lambda: [2, 2, 6, 2])
-    num_heads: List[int] = field(default_factory=lambda: [4, 8, 16, 32])
+    dropout: float = 0.1
+
+    # ResNet3D params
+    stem_channels: int = 64
     window_size: Tuple[int, int, int] = (7, 7, 7)
     patch_size: Tuple[int, int, int] = (2, 2, 2)
-    mlp_ratio: float = 4.0
-    dropout: float = 0.1
     use_checkpoint: bool = True
+
+    # ViT params
+    num_layers: int = 12
+    num_heads: int = 3
+    mlp_ratio: float = 4.0
+
+    # Legacy aliases (converted to num_layers/num_heads for ViT backbones)
+    depths: List[int] = field(default_factory=lambda: [2, 2, 6, 2])
+
+    # NCS pretrained
+    ncs_pretrained: str = "NorskRegnesentralSTI/NCS-v1-2.5d-base"
+    ncs_mode: str = "2.5d"  # '3d' or '2.5d'
+
+    # Volume dimensions
+    img_size: Tuple[int, int, int] = (128, 256, 256)
 
 
 @dataclass
 class WellLogEncoderConfig:
     """Configuration for the 1D Well Log Encoder."""
+    # Backbone selection: 'cnn_transformer', 'wlfm'
+    backbone: str = "wlfm"
+
+    # Shared params
     num_curves: int = 7
-    stem_channels: List[int] = field(default_factory=lambda: [32, 64, 128])
-    kernel_sizes: List[int] = field(default_factory=lambda: [3, 5, 7])
     embed_dim: int = 192
-    num_layers: int = 4
-    num_heads: int = 8
-    mlp_ratio: float = 4.0
     dropout: float = 0.1
     max_seq_len: int = 512
+
+    # CNN+Transformer params
+    stem_channels: List[int] = field(default_factory=lambda: [32, 64, 128])
+    kernel_sizes: List[int] = field(default_factory=lambda: [3, 5, 7])
+    num_layers: int = 6
+    num_heads: int = 8
+    mlp_ratio: float = 4.0
     use_physics_constraint: bool = True
+
+    # WLFM params
+    wlfm_vq_embed_dim: int = 256
+    wlfm_num_embeddings: int = 512
+    wlfm_patch_len: int = 64
+    wlfm_patch_stride: int = 32
+    wlfm_pretrained_path: str = ""  # Local checkpoint path (when available)
 
 
 @dataclass

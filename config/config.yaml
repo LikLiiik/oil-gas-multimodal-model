@@ -24,29 +24,46 @@ data:
 model:
   # Seismic Encoder
   seismic_encoder:
+    # Backbone: 'resnet3d' | 'swin3d' | 'ncs' (NCS-Model pretrained)
+    backbone: "ncs"
     in_channels: 1
-    stem_channels: 64
-    embed_dim: 192
-    depths: [2, 2, 6, 2]        # Swin block depths per stage
-    num_heads: [4, 8, 16, 32]   # Attention heads per stage
-    window_size: [7, 7, 7]      # 3D window size
-    patch_size: [2, 2, 2]       # 3D patch size
+    embed_dim: 768               # NCS-Base: 768; use 192 for tiny, 384 for small
+    num_layers: 12               # ViT encoder layers
+    num_heads: 12                # ViT attention heads
     mlp_ratio: 4.0
     dropout: 0.1
-    use_checkpoint: true        # Gradient checkpointing for memory
+    use_checkpoint: true
+    # NCS pretrained settings
+    ncs_pretrained: "NorskRegnesentralSTI/NCS-v1-2.5d-base"
+    ncs_mode: "2.5d"             # '3d' or '2.5d'
+    img_size: [128, 256, 256]    # Input volume shape (D, H, W)
+    # Legacy params (for resnet3d backward compat)
+    stem_channels: 64
+    depths: [2, 2, 6, 2]
+    window_size: [7, 7, 7]
+    patch_size: [2, 2, 2]
 
   # Well Log Encoder
   well_log_encoder:
+    # Backbone: 'cnn_transformer' | 'wlfm' (WLFM)
+    backbone: "wlfm"
     num_curves: 7
-    stem_channels: [32, 64, 128]  # Multi-scale CNN channels
-    kernel_sizes: [3, 5, 7]       # Multi-scale kernels
-    embed_dim: 192
-    num_layers: 4
-    num_heads: 8
+    embed_dim: 192               # WLFM-small: 192
+    num_layers: 6                # Transformer layers
+    num_heads: 6                 # Attention heads
     mlp_ratio: 4.0
     dropout: 0.1
     max_seq_len: 512
-    use_physics_constraint: true   # Enable physics-aware encoding
+    use_physics_constraint: true
+    # WLFM specific
+    wlfm_vq_embed_dim: 256
+    wlfm_num_embeddings: 512     # Codebook size (geological vocabulary)
+    wlfm_patch_len: 64
+    wlfm_patch_stride: 32
+    wlfm_pretrained_path: ""     # Local checkpoint path (when weights released)
+    # Legacy params (for cnn_transformer backward compat)
+    stem_channels: [32, 64, 128]
+    kernel_sizes: [3, 5, 7]
 
   # Fusion Module
   fusion:
