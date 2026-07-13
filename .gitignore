@@ -21,7 +21,7 @@ env/
 .ipynb_checkpoints/
 *.ipynb
 
-# Model checkpoints
+# Model checkpoints (local training outputs)
 checkpoints/
 *.pt
 *.pth
@@ -29,15 +29,6 @@ checkpoints/
 # Logs
 logs/
 *.log
-
-# Data (large files)
-*.h5
-*.hdf5
-*.segy
-*.sgy
-*.las
-data/raw/
-data/processed/
 
 # WandB
 wandb/
@@ -49,4 +40,77 @@ Thumbs.db
 # Environment
 .env
 .claude/
+
+# Local reference documents
 *.pdf
+
+# =============================================================================
+# Seismic & geophysical binary data
+# =============================================================================
+seismic/
+
+# Seismic volumes
+*.segy
+*.sgy
+*.SEGY
+*.cbvs
+*.cbv
+*.2ds
+
+# Well logs & drilling
+*.las
+*.LAS
+*.dlis
+*.DLIS
+*.lis
+*.LIS
+*.wlt
+*.well
+*.wlm
+*.disp
+*.tie
+
+# Arrays / volumes
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# Horizons & surfaces
+*.hor
+*.par
+*.hov
+*.wvlt
+
+# Archives (dataset downloads)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# =============================================================================
+# Dataset directories — download & prepare locally (scripts/prepare_*.py)
+# Keep data/*.py source modules tracked.
+# =============================================================================
+
+# Volve raw releases
+data/Volve_Well_logs_pr_WELL/
+data/Volve_WITSML_Realtime_drilling_data/
+data/Volve_Well_technical_data/
+
+# External benchmarks (RMOTC, Penobscot)
+data/rmotc/
+data/penobscot/
+
+# Prepared / processed outputs (regenerate via prepare scripts)
+data/raw/
+data/processed/
+data/prepared/
+data/volve_deviations/
+data/volve_deviations_synthetic_backup/
+
+# Model release weights (local only; manifest.json may stay tracked)
+releases/**/*.pt
+releases/**/*.pth

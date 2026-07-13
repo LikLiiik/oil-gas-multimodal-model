@@ -706,30 +706,47 @@ class WLFMWellLogEncoder1D(nn.Module):
         patches = patches.permute(0, 2, 1, 3)  # (B, P, C, patch_len)
         return patches, patches.shape[1]
 
-    def _per_well_normalize(self, x: torch.Tensor) -> torch.Tensor:
+    def _apply_curve_mask(
+        self,
+        x: torch.Tensor,
+        curve_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Zero out missing curve channels using (B, C) mask."""
+        if curve_mask is None:
+            return x
+        return x * curve_mask.unsqueeze(-1)
+
+    def _per_well_normalize(
+        self,
+        x: torch.Tensor,
+        curve_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Per-well z-score normalization (following WLFM).
 
         Args:
             x: (B, C, L) well log curves
+            curve_mask: Optional (B, C) binary mask, 1=valid curve
         Returns:
             normalized curves
         """
-        # Compute per-well per-curve statistics
-        # Exclude zero values (missing data) from statistics
-        mask = (x != 0).float()
+        if curve_mask is not None:
+            mask = curve_mask.unsqueeze(-1).expand_as(x)
+        else:
+            mask = (x != 0).float()
 
         mean = (x * mask).sum(dim=2, keepdim=True) / (mask.sum(dim=2, keepdim=True) + 1e-8)
         var = ((x - mean) * mask).pow(2).sum(dim=2, keepdim=True) / (mask.sum(dim=2, keepdim=True) + 1e-8)
         std = torch.sqrt(var + 1e-8)
 
         x_norm = (x - mean) / std
-        x_norm = x_norm * mask  # Keep zeros as zeros
-
+        x_norm = x_norm * mask
         return x_norm
 
     def tokenize(
-        self, x: torch.Tensor
+        self,
+        x: torch.Tensor,
+        curve_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Tokenize well log sequences into discrete geological tokens.
@@ -746,8 +763,10 @@ class WLFMWellLogEncoder1D(nn.Module):
         """
         B, C, L = x.shape
 
+        x = self._apply_curve_mask(x, curve_mask)
+
         # Per-well normalization
-        x_norm = self._per_well_normalize(x)
+        x_norm = self._per_well_normalize(x, curve_mask=curve_mask)
 
         # Segment into patches
         patches, P = self._segment_patches(x_norm)  # (B, P, C, patch_len)
@@ -779,6 +798,7 @@ class WLFMWellLogEncoder1D(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        curve_mask: Optional[torch.Tensor] = None,
         return_sequence: bool = False,
         return_token_info: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -787,25 +807,25 @@ class WLFMWellLogEncoder1D(nn.Module):
 
         Args:
             x: (B, C, L) well log curves
-            mask: Optional (B, L) raw curve mask (will be adapted to patches)
+            mask: Optional (B, L) depth mask (adapted to patch level)
+            curve_mask: Optional (B, C) binary mask, 1=valid curve, 0=missing
             return_sequence: Return full patch sequence features
             return_token_info: Return tokenization details
 
         Returns:
             global_features: (B, embed_dim)
             sequence_features: (B, P, embed_dim) if return_sequence, else None
-            (optionally token_info dict if return_token_info)
         """
-        B, C, L = x.shape
+        x = self._apply_curve_mask(x, curve_mask)
 
         # Per-well normalization
-        x_norm = self._per_well_normalize(x)
+        x_norm = self._per_well_normalize(x, curve_mask=curve_mask)
 
         # Segment into patches
         patches, P = self._segment_patches(x_norm)  # (B, P, C, patch_len)
 
         # Tokenize patches through VQ-VAE
-        tokenized = self.tokenize(x)
+        tokenized = self.tokenize(x, curve_mask=curve_mask)
         tokens = tokenized["tokens"]  # (B, P, vq_embed_dim)
         vq_loss = tokenized["vq_loss"]
 
@@ -856,6 +876,7 @@ class WLFMWellLogEncoder1D(nn.Module):
         self,
         x: torch.Tensor,
         mask_ratio: float = 0.5,
+        curve_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Masked Token Modeling (MTM) forward pass.
@@ -877,14 +898,23 @@ class WLFMWellLogEncoder1D(nn.Module):
         """
         B, C, L = x.shape
 
+        x = self._apply_curve_mask(x, curve_mask)
+
         # Normalize and segment
-        x_norm = self._per_well_normalize(x)
+        x_norm = self._per_well_normalize(x, curve_mask=curve_mask)
         patches, P = self._segment_patches(x_norm)
 
         # Tokenize all patches (get ground truth indices)
-        tokenized = self.tokenize(x)
+        tokenized = self.tokenize(x, curve_mask=curve_mask)
         target_indices = tokenized["indices"]  # (B, P)
         tokens = tokenized["tokens"]  # (B, P, vq_embed_dim)
+
+        # Patches with no valid curves should not contribute to MTM loss
+        if curve_mask is not None:
+            patch_curve_mask = curve_mask.unsqueeze(1).expand(-1, P, -1)  # (B, P, C)
+            patch_valid = (patches.abs() * patch_curve_mask.unsqueeze(-1)).sum(dim=(2, 3)) > 1e-6
+        else:
+            patch_valid = patches.abs().sum(dim=(2, 3)) > 1e-6
 
         # Random masking
         num_mask = int(P * mask_ratio)
@@ -923,11 +953,15 @@ class WLFMWellLogEncoder1D(nn.Module):
         # Predict token indices
         logits = self.mtm_head(seq_feat)  # (B, P, num_embeddings)
 
-        # Compute loss (only on masked positions)
-        loss = F.cross_entropy(
-            logits[mask_shuffled],
-            target_indices[mask_shuffled],
-        )
+        # Compute loss (only on masked positions with valid curves)
+        train_mask = mask_shuffled & patch_valid
+        if train_mask.any():
+            loss = F.cross_entropy(
+                logits[train_mask],
+                target_indices[train_mask],
+            )
+        else:
+            loss = logits.sum() * 0.0
 
         # Restore original order
         idx_restore_expand = ids_restore.unsqueeze(-1).expand(-1, -1, logits.shape[-1])

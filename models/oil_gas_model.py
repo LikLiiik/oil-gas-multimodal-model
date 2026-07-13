@@ -55,28 +55,7 @@ def _build_seismic_encoder(config) -> nn.Module:
     cfg = config.seismic_encoder
 
     if backbone == "ncs":
-        # Try pretrained first (may fail offline -> fallback to from-scratch)
-        try:
-            import os as _os
-            if _os.environ.get("HF_HUB_OFFLINE", "") == "1":
-                raise RuntimeError("Offline mode")
-            return NCSSeismicEncoder3D.from_pretrained(
-                pretrained_name=getattr(cfg, 'ncs_pretrained',
-                                         "NorskRegnesentralSTI/NCS-v1-2.5d-base"),
-                img_size=getattr(cfg, 'img_size', (128, 256, 256)),
-                embed_dim=cfg.embed_dim,
-                num_layers=getattr(cfg, 'num_layers', 12),
-                num_heads=getattr(cfg, 'num_heads', 3),
-                mlp_ratio=getattr(cfg, 'mlp_ratio', 4.0),
-                dropout=cfg.dropout,
-                mode=getattr(cfg, 'ncs_mode', '2.5d'),
-                in_channels=cfg.in_channels,
-                use_checkpoint=getattr(cfg, 'use_checkpoint', True),
-            )
-        except Exception:
-            pass
-        # Offline fallback: build from scratch
-        return NCSSeismicEncoder3D(
+        scratch_kwargs = dict(
             in_channels=cfg.in_channels,
             img_size=getattr(cfg, 'img_size', (128, 256, 256)),
             embed_dim=cfg.embed_dim,
@@ -87,6 +66,17 @@ def _build_seismic_encoder(config) -> nn.Module:
             mode=getattr(cfg, 'ncs_mode', '2.5d'),
             use_checkpoint=getattr(cfg, 'use_checkpoint', True),
         )
+        use_pretrained = getattr(cfg, 'use_pretrained', False)
+        pretrained_name = getattr(cfg, 'ncs_pretrained', '') or ''
+        if use_pretrained and pretrained_name:
+            try:
+                return NCSSeismicEncoder3D.from_pretrained(
+                    pretrained_name=pretrained_name,
+                    **scratch_kwargs,
+                )
+            except Exception:
+                pass
+        return NCSSeismicEncoder3D(**scratch_kwargs)
     elif backbone == "swin3d":
         from .seismic_encoder import SwinSeismicEncoder3D
         return SwinSeismicEncoder3D(
@@ -122,8 +112,7 @@ def _build_well_log_encoder(config) -> nn.Module:
     cfg = config.well_log_encoder
 
     if backbone == "wlfm":
-        return WLFMWellLogEncoder1D.from_pretrained(
-            pretrained_path=getattr(cfg, 'wlfm_pretrained_path', None),
+        wlfm_kwargs = dict(
             num_curves=cfg.num_curves,
             max_seq_len=cfg.max_seq_len,
             embed_dim=cfg.embed_dim,
@@ -137,6 +126,13 @@ def _build_well_log_encoder(config) -> nn.Module:
             dropout=cfg.dropout,
             use_physics_constraint=cfg.use_physics_constraint,
         )
+        pretrained_path = getattr(cfg, 'wlfm_pretrained_path', None) or ''
+        if pretrained_path.strip():
+            return WLFMWellLogEncoder1D.from_pretrained(
+                pretrained_path=pretrained_path,
+                **wlfm_kwargs,
+            )
+        return WLFMWellLogEncoder1D(**wlfm_kwargs)
     else:  # cnn_transformer (default)
         return WellLogEncoder1D(
             num_curves=cfg.num_curves,
@@ -404,6 +400,11 @@ class OilGasModelForPretraining(nn.Module):
             nn.Linear(hidden_dim, proj_dim),
         )
         self.well_proj_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, proj_dim),
+        )
+        self.fusion_proj_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, proj_dim),

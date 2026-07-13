@@ -1,0 +1,23 @@
+{
+  "release": "pretrain_multi_v1",
+  "created_at": "2026-07-13T20:08:00+08:00",
+  "description": "Multi-field staged pretrain on Volve + RMOTC + Penobscot (verified geometry only)",
+  "datasets": ["volve", "rmotc", "penobscot"],
+  "training": {
+    "script": "scripts/train_pretrain_multi.py",
+    "stage1": "MSM + MWM, early-stopped at epoch 22 (best val epoch 7)",
+    "stage2": "CMCL + SWM, in progress at release time",
+    "batch_size": 4,
+    "well_seq_len": 128,
+    "seismic_patch": [32, 32, 32],
+    "embed_dim": 192,
+    "train_samples": 8987,
+    "val_samples": 2022
+  },
+  "checkpoints": {
+    "best_stage1": "best_stage1.pt",
+    "stage1_final": "stage1_final.pt",
+    "best_stage2": "best_stage2.pt"
+  },
+  "load_for_finetune": "best_stage2.pt"
+}

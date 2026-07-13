@@ -386,7 +386,8 @@ def main():
                        choices=["lithology", "reservoir_prediction", "fault_detection"])
     parser.add_argument("--pretrained", type=str, default=None,
                        help="Path to pretrained checkpoint")
-    parser.add_argument("--data_dir", type=str, default=r"E:\oilmodel")
+    parser.add_argument("--data_dir", type=str,
+                        default=str(Path(__file__).parent.parent))
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-5)

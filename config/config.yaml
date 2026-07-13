@@ -11,7 +11,7 @@ data:
     sample_interval_ms: 2.0  # ms
 
   well_log:
-    num_curves: 7  # GR, RT, DEN, POR, AC, SP, CAL
+    num_curves: 9  # GR, SP, CAL, RD, MLL, MSFL, NPHI, RHOB, DT
     curve_names: ["GR", "RT", "DEN", "POR", "AC", "SP", "CAL"]
     sequence_length: 512
     depth_interval_m: 0.125  # meters
@@ -47,7 +47,7 @@ model:
   well_log_encoder:
     # Backbone: 'cnn_transformer' | 'wlfm' (WLFM)
     backbone: "wlfm"
-    num_curves: 7
+    num_curves: 9
     embed_dim: 192               # WLFM-small: 192
     num_layers: 6                # Transformer layers
     num_heads: 6                 # Attention heads

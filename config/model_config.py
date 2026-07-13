@@ -36,7 +36,8 @@ class SeismicEncoderConfig:
     # Legacy aliases (converted to num_layers/num_heads for ViT backbones)
     depths: List[int] = field(default_factory=lambda: [2, 2, 6, 2])
 
-    # NCS pretrained
+    # NCS pretrained (disabled by default; set use_pretrained=True to load HF weights)
+    use_pretrained: bool = False
     ncs_pretrained: str = "NorskRegnesentralSTI/NCS-v1-2.5d-base"
     ncs_mode: str = "2.5d"  # '3d' or '2.5d'
 
@@ -51,7 +52,7 @@ class WellLogEncoderConfig:
     backbone: str = "wlfm"
 
     # Shared params
-    num_curves: int = 7
+    num_curves: int = 9
     embed_dim: int = 192
     dropout: float = 0.1
     max_seq_len: int = 512
@@ -123,7 +124,7 @@ class DataConfig:
     seismic_xline_range: Tuple[int, int] = (0, 256)
     seismic_sample_interval_ms: float = 2.0
 
-    well_log_num_curves: int = 7
+    well_log_num_curves: int = 9
     well_log_curve_names: List[str] = field(
         default_factory=lambda: ["GR", "RT", "DEN", "POR", "AC", "SP", "CAL"]
     )

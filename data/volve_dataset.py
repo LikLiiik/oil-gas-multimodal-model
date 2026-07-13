@@ -262,47 +262,44 @@ class LASWellLoader:
     Parse and standardize LAS well log files.
 
     Reads LAS 2.0 files and provides consistent curve access across wells.
-    Supports curve aliasing to standardize naming conventions.
-
-    Args:
-        curve_aliases: Dict mapping standard names to alternative curve mnemonics
+    Uses nine conventional slots from prepare_volve_data (GR/SP/CAL/RD/MLL/MSFL/NPHI/RHOB/DT).
+    RD slot accepts RT as fallback. RACELM/RACEHM etc. are NOT mapped to MLL/MSFL.
     """
-
-    # Standard curve aliases across the Volve dataset
-    DEFAULT_ALIASES = {
-        "GR": ["GR", "GR_1", "GRC", "SGR", "GAMMA"],
-        "RT": ["RT", "RDEEP", "RLA5", "AT90", "AT90M", "ILD"],
-        "RHOB": ["RHOB", "RHOZ", "RHO8", "DEN", "DENSITY"],
-        "NPHI": ["NPHI", "NPHI_1", "TNPH", "NEUTRON", "NEU"],
-        "DT": ["DT", "DTCO", "AC", "SONIC", "DTC"],
-        "DTS": ["DTS", "DTSM", "DTST", "DTSH"],
-        "CALI": ["CALI", "CAL", "HCAL", "CALIPER", "BS"],
-        "DRHO": ["DRHO", "HDRA", "CORRECTION"],
-        "PEF": ["PEF", "PEFZ", "PE", "PHOTOELECTRIC"],
-        "SP": ["SP", "SP_1"],
-        "ROP": ["ROP", "ROP_1"],
-        # Petrophysical outputs (labels)
-        "VSH": ["VSH", "VSH_1", "VSHALE", "VSH_GR", "VOLUME_OF_SHALE"],
-        "PHIF": ["PHIF", "PHI", "POR", "POROSITY", "PHIT", "FINAL_POROSITY"],
-        "SW": ["SW", "SW_1", "SWT", "WATER_SATURATION"],
-        "KLOGH": ["KLOGH", "PERM", "PERMEABILITY", "K_LOGH"],
-        "SAND_FLAG": ["SAND_FLAG", "SAND", "SAND_FLAG_1"],
-        "COAL_FLAG": ["COAL_FLAG", "COAL"],
-        "CARB_FLAG": ["CARB_FLAG", "CARBONATE_FLAG", "VCARB"],
-        "BVW": ["BVW", "BOUND_VOLUME_WATER"],
-        "FACIES": ["FACIES", "LITHOFACIES", "LITHOLOGY"],
-    }
 
     def __init__(
         self,
         curve_aliases: Optional[Dict[str, List[str]]] = None,
     ):
-        self.curve_aliases = curve_aliases or self.DEFAULT_ALIASES
-        # Reverse mapping: alternative name -> standard name
+        if curve_aliases is None:
+            try:
+                from .prepare_volve_data import CURVE_ALIASES
+                curve_aliases = CURVE_ALIASES
+            except ImportError:
+                curve_aliases = self._legacy_aliases()
+        self.curve_aliases = curve_aliases
         self._alias_map = {}
         for std_name, aliases in self.curve_aliases.items():
+            if std_name == "RT_FALLBACK":
+                for alias in aliases:
+                    self._alias_map[alias.upper()] = "RT"
+                continue
             for alias in aliases:
                 self._alias_map[alias.upper()] = std_name
+
+    @staticmethod
+    def _legacy_aliases() -> Dict[str, List[str]]:
+        return {
+            "GR": ["GR", "NBGRCFM"],
+            "SP": ["SP"],
+            "CAL": ["CALI", "BS"],
+            "RD": ["RD"],
+            "RT_FALLBACK": ["RT"],
+            "MLL": ["MLL", "ILM"],
+            "MSFL": ["MSFL", "RXO"],
+            "NPHI": ["NPHI"],
+            "RHOB": ["RHOB"],
+            "DT": ["DT"],
+        }
 
     def read(self, las_path: str) -> Dict[str, np.ndarray]:
         """
@@ -445,15 +442,29 @@ class LASWellLoader:
         elif "DEPT" in result:
             result["depth"] = result.pop("DEPT")
 
+        try:
+            from .prepare_volve_data import apply_rd_rt_fallback
+            apply_rd_rt_fallback(result)
+        except ImportError:
+            pass
+
         return result
 
     def get_standard_curves(self, data: Dict) -> List[str]:
-        """Return which standard curves are available in the data."""
-        available = []
-        for std_name in self.curve_aliases:
-            if std_name in data:
-                available.append(std_name)
-        return available
+        """Return which nine conventional slots are available in the data."""
+        try:
+            from .prepare_volve_data import STANDARD_CURVES, map_standard_curves
+            raw = [k for k in data if k not in ("depth", "header", "null_value", "well_name", "las_path",
+                                                 "latitude", "longitude", "kb_elevation_m")]
+            return map_standard_curves(raw)
+        except ImportError:
+            available = []
+            for std_name in self.curve_aliases:
+                if std_name in ("RT_FALLBACK",):
+                    continue
+                if std_name in data:
+                    available.append(std_name)
+            return available
 
 
 # ==============================================================================
@@ -490,31 +501,82 @@ class VolveDataset(Dataset):
         train_wells: Optional[List[str]] = None,
         val_wells: Optional[List[str]] = None,
         norm_stats: Optional[Dict] = None,
+        require_verified_geometry: bool = True,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
+        self.require_verified_geometry = require_verified_geometry
+
+        # Resolve paths (supports project_root layout: seismic/ + data/Volve_...)
+        try:
+            from .prepare_volve_data import load_prepared_layout, resolve_project_paths
+            layout = load_prepared_layout(self.data_dir)
+            if layout is None:
+                layout = resolve_project_paths(self.data_dir)
+            self.segy_path = Path(layout["segy_path"]) if layout.get("segy_path") else None
+            self.well_dir = Path(layout["well_dir"])
+            self.deviations_dir = Path(
+                layout.get("deviations_dir", self.data_dir / "data" / "prepared" / "deviations")
+            )
+        except ImportError:
+            self.segy_path = next(iter(self.data_dir.glob("*.segy")), None)
+            if self.segy_path is None:
+                seis_dir = self.data_dir / "seismic"
+                self.segy_path = next(iter(seis_dir.glob("*.segy")), None) if seis_dir.exists() else None
+            self.well_dir = self.data_dir / "Volve_Well_logs_pr_WELL" / "Well_logs_pr_WELL"
+            if not self.well_dir.exists():
+                alt = self.data_dir / "data" / "Volve_Well_logs_pr_WELL" / "Well_logs_pr_WELL"
+                self.well_dir = alt if alt.exists() else self.well_dir
+            self.deviations_dir = self.data_dir / "data" / "prepared" / "deviations"
+
         self.mode = mode
         self.task = task
         self.seismic_patch_size = seismic_patch_size
         self.well_seq_len = well_seq_len
 
-        # Default well curves (standard geophysical logs)
-        self.well_curves = well_curves or [
-            "GR", "RT", "RHOB", "NPHI", "DT", "CALI", "PEF",
-        ]
+        # Load prepared well metadata if available
+        self.well_metadata = {}
+        meta_path = self.data_dir / "data" / "prepared" / "well_metadata.json"
+        if not meta_path.exists():
+            meta_path = Path(__file__).parent / "prepared" / "well_metadata.json"
+        if meta_path.exists():
+            import json
+            with open(meta_path, encoding="utf-8") as f:
+                self.well_metadata = json.load(f)
+            print(f"Loaded prepared metadata for {len(self.well_metadata)} wells")
+
+        # Deviation inventory (for geometry quality filtering)
+        self.deviation_inventory: Dict = {}
+        dev_inv_path = self.data_dir / "data" / "prepared" / "deviation_inventory.json"
+        if not dev_inv_path.exists():
+            dev_inv_path = Path(__file__).parent / "prepared" / "deviation_inventory.json"
+        if dev_inv_path.exists():
+            import json
+            with open(dev_inv_path, encoding="utf-8") as f:
+                self.deviation_inventory = json.load(f)
+
+        # Default: nine conventional log slots
+        try:
+            from .prepare_volve_data import STANDARD_CURVES
+            default_curves = list(STANDARD_CURVES)
+        except ImportError:
+            default_curves = ["GR", "SP", "CAL", "RD", "MLL", "MSFL", "NPHI", "RHOB", "DT"]
+        self.well_curves = well_curves or default_curves
 
         # Load seismic
-        segy_path = list(self.data_dir.glob("*.segy"))[0]
-        print(f"Loading seismic from {segy_path}...")
-        self.seismic = SEGYLoader(str(segy_path))
+        if self.segy_path is None or not self.segy_path.exists():
+            raise FileNotFoundError(
+                f"No SEG-Y file found under {self.data_dir}. "
+                "Place seismic/*.segy or run: python scripts/prepare_data.py"
+            )
+        print(f"Loading seismic from {self.segy_path}...")
+        self.seismic = SEGYLoader(str(self.segy_path))
         print(f"  Shape: {self.seismic.shape}")
 
-        # Find and load well logs
-        self.well_dir = self.data_dir / "Volve_Well_logs_pr_WELL" / "Well_logs_pr_WELL"
         self.las_loader = LASWellLoader()
 
         self.wells = self._discover_wells()
-        print(f"Found {len(self.wells)} wells with petrophysical data")
+        print(f"Found {len(self.wells)} wells with usable LAS data")
 
         # Load all well data
         self.well_data = {}
@@ -527,11 +589,14 @@ class VolveDataset(Dataset):
         print(f"Loaded {len(self.well_data)} wells successfully")
 
         # ---- Build Well-Seismic Physical Alignment ----
-        # Build well trajectories from known coordinates + deviation surveys
-        self.trajectories = build_well_trajectories(VOLVE_WELL_COORDS)
+        self.trajectories = build_well_trajectories(
+            VOLVE_WELL_COORDS, well_metadata=self.well_metadata
+        )
 
-        # Load deviation surveys from CSV files
-        dev_dir = Path(__file__).parent / "volve_deviations"
+        # Load deviation surveys from prepared directory (real LWD/SODIR)
+        dev_dir = self.deviations_dir
+        if not dev_dir.exists():
+            dev_dir = Path(__file__).parent / "volve_deviations"
         dev_loaded = 0
         if dev_dir.exists():
             for well_name in self.well_data.keys():
@@ -542,7 +607,7 @@ class VolveDataset(Dataset):
                     if success:
                         dev_loaded += 1
             if dev_loaded > 0:
-                print(f"Loaded deviation surveys for {dev_loaded} wells")
+                print(f"Loaded deviation surveys for {dev_loaded} wells from {dev_dir}")
 
         # Verify which wells have trajectory data
         wells_with_traj = set(self.trajectories.keys()) & set(self.well_data.keys())
@@ -565,6 +630,9 @@ class VolveDataset(Dataset):
                 print(f"  {wn}: ({traj.surface_lat:.6f},{traj.surface_lon:.6f})"
                       f" -> IL={il:.1f}, XL={xl:.1f}, 水平位移={max_off:.0f}m")
         # ---- End Well-Seismic Alignment ----
+
+        if self.require_verified_geometry:
+            self.well_data = self._filter_geometry_verified_wells(self.well_data)
 
         # Train/val split
         well_names = sorted(self.well_data.keys())
@@ -590,59 +658,93 @@ class VolveDataset(Dataset):
         else:
             self.norm_stats = self._compute_norm_stats()
 
+    def _filter_geometry_verified_wells(self, well_data: Dict) -> Dict:
+        """Drop wells with hardcoded coords or assumed-vertical trajectory."""
+        try:
+            from .prepare_volve_data import is_geometry_verified
+        except ImportError:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "prepare_volve_data",
+                Path(__file__).parent / "prepare_volve_data.py",
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            is_geometry_verified = mod.is_geometry_verified
+
+        verified: Dict = {}
+        excluded: List[str] = []
+        for well_name, data in well_data.items():
+            has_dev = (
+                well_name in self.trajectories
+                and self.trajectories[well_name].has_deviation
+            )
+            if is_geometry_verified(
+                well_name,
+                self.well_metadata,
+                self.deviation_inventory,
+                has_dev,
+            ):
+                verified[well_name] = data
+            else:
+                excluded.append(well_name)
+
+        if excluded:
+            print(
+                f"Excluded {len(excluded)} wells from train/val "
+                f"(estimated geometry): {sorted(excluded)}"
+            )
+        print(f"Geometry-verified wells for training: {len(verified)}")
+        return verified
+
     def _discover_wells(self) -> List[str]:
-        """Find wells that have petrophysical interpretation data."""
+        """Find wells with usable LAS data (INPUT, LFP, CPI, or LWD)."""
+        if self.well_metadata:
+            return sorted(self.well_metadata.keys())
+
         wells = []
+        if not self.well_dir.exists():
+            return wells
+
         for well_dir in sorted(self.well_dir.iterdir()):
             if well_dir.is_dir() and not well_dir.name.startswith("."):
-                # Check for petrophysical LAS files
-                petro_dir = well_dir / "05.PETROPHYSICAL INTERPRETATION"
-                if petro_dir.exists():
-                    # Check for CPI or WLC files
-                    has_data = False
-                    for subdir in petro_dir.iterdir():
-                        if subdir.is_dir():
-                            las_files = list(subdir.glob("*.las"))
-                            if las_files:
-                                has_data = True
-                                break
-                    # Also check for WLC files directly
-                    las_files = list(petro_dir.glob("*.las"))
-                    if las_files:
-                        has_data = True
-
-                    if has_data:
-                        wells.append(well_dir.name)
-
+                if self._find_best_las(well_dir.name) is not None:
+                    wells.append(well_dir.name)
         return wells
 
     def _find_best_las(self, well_name: str) -> Optional[Path]:
         """
         Find the best LAS file for a well.
-        Priority: WLC_PETRO_COMPUTED_INPUT > CPI > LFP > any LAS.
+        Priority: prepared metadata > INPUT > LFP > CPI > any LAS.
         """
-        well_dir = self.well_dir / well_name / "05.PETROPHYSICAL INTERPRETATION"
-        if not well_dir.exists():
+        meta = self.well_metadata.get(well_name, {})
+        if meta.get("best_las"):
+            p = self.data_dir / meta["best_las"]
+            if p.exists():
+                return p
+
+        well_dir = self.well_dir / well_name
+        if not well_dir.is_dir():
             return None
 
-        # Priority order
+        try:
+            from .prepare_volve_data import find_best_las_for_well
+            return find_best_las_for_well(well_dir)
+        except ImportError:
+            pass
+
         patterns = [
-            "WLC_PETRO_COMPUTED_INPUT*.LAS",
-            "WLC_PETRO_COMPUTED_INPUT*.las",
-            "*CPI*.las",
-            "*CPI*.LAS",
-            "*.las",
-            "*.LAS",
+            "05.PETROPHYSICAL INTERPRETATION/WLC_PETRO_COMPUTED_INPUT*.LAS",
+            "05.PETROPHYSICAL INTERPRETATION/WLC_PETRO_COMPUTED_INPUT*.las",
+            "06.LFP/*LFP*.las",
+            "06.LFP/*LFP*.LAS",
+            "05.PETROPHYSICAL INTERPRETATION/*CPI*.las",
+            "05.PETROPHYSICAL INTERPRETATION/*.las",
         ]
-
-        # Also check CPI subdirectory
-        cpi_dir = well_dir / "CPI"
         for pattern in patterns:
-            for search_dir in [well_dir, cpi_dir] if cpi_dir.exists() else [well_dir]:
-                matches = list(search_dir.glob(pattern))
-                if matches:
-                    return matches[0]
-
+            matches = list(well_dir.glob(pattern))
+            if matches:
+                return matches[0]
         return None
 
     def _load_well_data(self, well_name: str) -> Optional[Dict]:
@@ -663,14 +765,28 @@ class VolveDataset(Dataset):
         data["well_name"] = well_name
         data["las_path"] = str(las_path)
 
-        # Extract well coordinates from header if available
-        # Volve wells have LATI/LONG in DMS format
+        header_meta = parse_well_header_from_las(str(las_path))
+        if header_meta.get("latitude") is not None:
+            data["latitude"] = header_meta["latitude"]
+        if header_meta.get("longitude") is not None:
+            data["longitude"] = header_meta["longitude"]
+        if header_meta.get("kb_elevation_m") is not None:
+            data["kb_elevation_m"] = header_meta["kb_elevation_m"]
+
+        meta = self.well_metadata.get(well_name, {})
+        if "latitude" not in data and meta.get("latitude") is not None:
+            data["latitude"] = meta["latitude"]
+        if "longitude" not in data and meta.get("longitude") is not None:
+            data["longitude"] = meta["longitude"]
+
         if "LATI" in data["header"]:
-            lat_str = data["header"]["LATI"]
-            data["latitude"] = self._parse_dms(lat_str)
+            lat = self._parse_dms(data["header"]["LATI"])
+            if not np.isnan(lat):
+                data["latitude"] = lat
         if "LONG" in data["header"]:
-            lon_str = data["header"]["LONG"]
-            data["longitude"] = self._parse_dms(lon_str)
+            lon = self._parse_dms(data["header"]["LONG"])
+            if not np.isnan(lon):
+                data["longitude"] = lon
 
         return data
 
@@ -698,7 +814,10 @@ class VolveDataset(Dataset):
     def _build_sample_index(self) -> List[Dict]:
         """Build a list of all possible (well, depth_start) sample indices."""
         samples = []
-        wells_to_use = self.train_wells if self.mode != "test" else self.train_wells + self.val_wells
+        if self.mode in ("test", "val"):
+            wells_to_use = self.val_wells
+        else:
+            wells_to_use = self.train_wells
 
         for well_name in wells_to_use:
             if well_name not in self.well_data:
@@ -912,58 +1031,56 @@ class VolveDataset(Dataset):
         # Well log sequence
         well_seq = self._extract_well_sequence(well_name, depth_start)
         well_curves_arr = []
+        curve_mask_arr = []
         well_mask = np.ones(self.well_seq_len, dtype=np.float32)
 
         for curve_name in self.well_curves:
             if well_seq is not None and curve_name in well_seq:
-                vals = well_seq[curve_name]
-                mean = self.norm_stats.get(f"{curve_name}_mean", 0)
-                std = self.norm_stats.get(f"{curve_name}_std", 1)
-                vals = np.where(np.isnan(vals), 0, vals)
-                vals = (vals - mean) / std
-                well_mask = well_mask * (~np.isnan(well_seq[curve_name])).astype(np.float32) \
-                    if well_seq is not None else well_mask
+                raw = well_seq[curve_name]
+                valid = ~np.isnan(raw)
+                if np.any(valid):
+                    curve_mask_arr.append(1.0)
+                    mean = self.norm_stats.get(f"{curve_name}_mean", 0)
+                    std = self.norm_stats.get(f"{curve_name}_std", 1)
+                    vals = np.where(valid, raw, 0.0)
+                    vals = (vals - mean) / std
+                    well_mask = well_mask * valid.astype(np.float32)
+                else:
+                    curve_mask_arr.append(0.0)
+                    vals = np.zeros(self.well_seq_len, dtype=np.float32)
             else:
+                curve_mask_arr.append(0.0)
                 vals = np.zeros(self.well_seq_len, dtype=np.float32)
-                well_mask = np.zeros(self.well_seq_len, dtype=np.float32)
 
             well_curves_arr.append(vals)
 
         well_tensor = torch.from_numpy(np.stack(well_curves_arr)).float()
         mask_tensor = torch.from_numpy(well_mask).float()
+        curve_mask_tensor = torch.tensor(curve_mask_arr, dtype=torch.float32)
 
-        # Labels
+        # Labels (fixed keys so DataLoader can collate mixed wells)
+        label_specs = {
+            "sand_flag": "SAND_FLAG",
+            "coal_flag": "COAL_FLAG",
+            "porosity": "PHIF",
+            "water_saturation": "SW",
+            "vshale": "VSH",
+            "permeability": "KLOGH",
+        }
         labels = {}
-        if well_seq is not None:
-            if "SAND_FLAG" in well_seq:
-                labels["sand_flag"] = torch.from_numpy(
-                    np.nan_to_num(well_seq["SAND_FLAG"], nan=0).copy()
+        for label_key, las_key in label_specs.items():
+            if well_seq is not None and las_key in well_seq:
+                labels[label_key] = torch.from_numpy(
+                    np.nan_to_num(well_seq[las_key], nan=0).copy()
                 ).float()
-            if "COAL_FLAG" in well_seq:
-                labels["coal_flag"] = torch.from_numpy(
-                    np.nan_to_num(well_seq["COAL_FLAG"], nan=0).copy()
-                ).float()
-            if "PHIF" in well_seq:
-                labels["porosity"] = torch.from_numpy(
-                    np.nan_to_num(well_seq["PHIF"], nan=0).copy()
-                ).float()
-            if "SW" in well_seq:
-                labels["water_saturation"] = torch.from_numpy(
-                    np.nan_to_num(well_seq["SW"], nan=0).copy()
-                ).float()
-            if "VSH" in well_seq:
-                labels["vshale"] = torch.from_numpy(
-                    np.nan_to_num(well_seq["VSH"], nan=0).copy()
-                ).float()
-            if "KLOGH" in well_seq:
-                labels["permeability"] = torch.from_numpy(
-                    np.nan_to_num(well_seq["KLOGH"], nan=0).copy()
-                ).float()
+            else:
+                labels[label_key] = torch.zeros(self.well_seq_len, dtype=torch.float32)
 
         return {
             "seismic": seis_tensor,
             "well_log": well_tensor,
             "well_mask": mask_tensor,
+            "curve_mask": curve_mask_tensor,
             "labels": labels,
             "well_name": well_name,
             "depth_start": depth_start,
@@ -975,7 +1092,7 @@ class VolveDataset(Dataset):
 # ==============================================================================
 
 def create_volve_dataloaders(
-    data_dir: str = r"E:\oilmodel",
+    data_dir: str = None,
     seismic_patch_size: Tuple[int, int, int] = (64, 64, 64),
     well_seq_len: int = 256,
     well_curves: Optional[List[str]] = None,
@@ -989,6 +1106,9 @@ def create_volve_dataloaders(
         train_loader, val_loader
     """
     from torch.utils.data import DataLoader
+
+    if data_dir is None:
+        data_dir = str(Path(__file__).resolve().parents[1])
 
     train_ds = VolveDataset(
         data_dir=data_dir,

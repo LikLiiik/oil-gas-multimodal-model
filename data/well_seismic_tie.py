@@ -256,10 +256,12 @@ class WellTrajectory:
     def __init__(
         self,
         well_name: str,
-        surface_lat: float,
-        surface_lon: float,
+        surface_lat: float = 0.0,
+        surface_lon: float = 0.0,
         kb_elevation: float = 0.0,
         ground_elevation: float = 0.0,
+        surface_e: Optional[float] = None,
+        surface_n: Optional[float] = None,
         # Deviation survey (None = vertical well)
         md_survey: Optional[np.ndarray] = None,
         inc_survey: Optional[np.ndarray] = None,
@@ -271,8 +273,11 @@ class WellTrajectory:
         self.kb_elevation = kb_elevation  # KB above MSL
         self.ground_elevation = ground_elevation  # Ground above MSL
 
-        # Convert surface to UTM
-        _, self.surface_e, self.surface_n = latlon_to_utm(surface_lat, surface_lon)
+        if surface_e is not None and surface_n is not None:
+            self.surface_e = float(surface_e)
+            self.surface_n = float(surface_n)
+        else:
+            _, self.surface_e, self.surface_n = latlon_to_utm(surface_lat, surface_lon)
 
         # Deviation survey
         self.has_deviation = md_survey is not None and len(md_survey) > 0
@@ -679,57 +684,84 @@ def parse_well_header_from_las(las_path: str) -> Dict:
     Extract well header information from LAS file.
 
     Returns dict with keys:
-        well_name, latitude, longitude, kb_elevation, ground_elevation,
-        permanent_datum, elev_log_zero
+        well_name, latitude, longitude, kb_elevation_m, ground_elevation_m,
+        log_start_md
     """
+    try:
+        from .prepare_volve_data import parse_las_well_header
+        return parse_las_well_header(Path(las_path))
+    except ImportError:
+        pass
+
     result = {}
+    null = -999.25
+    header_vals = {}
 
     with open(las_path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
 
+    in_well = False
+    for line in content.split("\n"):
+        if line.startswith("~W"):
+            in_well = True
+            continue
+        if line.startswith("~") and in_well:
+            break
+        if not in_well or "." not in line or line.startswith("#"):
+            continue
+        mnem = line.split(".")[0].strip().upper().rstrip(".")
+        val_part = line.split(":", 1)[0] if ":" in line else line
+        tokens = val_part.split()
+        if len(tokens) >= 2:
+            header_vals[mnem] = tokens[-1]
+
     for line in content.split("\n"):
         line_upper = line.upper()
 
-        # Coordinates (DMS format: "058 26' 29.907\" N")
-        if "LATI" in line_upper:
-            m = re.search(r"(\d+)\s+(\d+)'\s*([\d.]+)\"", line)
+        if "LATI" in line_upper or ("LAT" in line_upper and "PLAT" not in line_upper):
+            m = re.search(r"(\d+)[°\s]+(\d+)['\s]+([\d.]+)", line)
             if m:
                 deg, min_, sec = float(m.group(1)), float(m.group(2)), float(m.group(3))
                 hemi = "S" if "S" in line.split(":")[0].upper() else "N"
                 result["latitude"] = dms_to_decimal(deg, min_, sec, hemi)
 
-        if "LONG" in line_upper:
-            m = re.search(r"(\d+)\s+(\d+)'\s*([\d.]+)\"", line)
+        if "LONG" in line_upper or "LON" in line_upper:
+            m = re.search(r"(\d+)[°\s]+(\d+)['\s]+([\d.]+)", line)
             if m:
                 deg, min_, sec = float(m.group(1)), float(m.group(2)), float(m.group(3))
                 hemi = "W" if "W" in line.split(":")[0].upper() else "E"
                 result["longitude"] = dms_to_decimal(deg, min_, sec, hemi)
 
-        # Elevation datums
-        if "ELZ" in line_upper:
-            try:
-                vals = line.split(":")[0].split()
-                result["elev_log_zero"] = float(vals[-1])
-            except (ValueError, IndexError):
-                pass
-
-        if "PD" in line_upper and "." in line:
-            try:
-                vals = line.split(":")[0].split()
-                result["permanent_datum"] = vals[-1]
-            except (ValueError, IndexError):
-                pass
-
-        if "KB" in line_upper and "." in line:
-            try:
-                vals = line.split(":")[0].split()
-                result["kb_elevation"] = float(vals[-1])
-            except (ValueError, IndexError):
-                pass
-
         if "WELL" in line_upper and "." in line:
             well_name = line.split(":")[0].split(".")[-1].strip()
             result["well_name"] = well_name
+
+    def _f(key):
+        try:
+            v = float(header_vals[key])
+            return None if abs(v - null) < 1e-3 else v
+        except (KeyError, ValueError):
+            return None
+
+    elev_type = header_vals.get("ELEV_TYPE", "").upper()
+    apd, edf, ekb = _f("APD"), _f("EDF"), _f("EKB")
+    elev, egl, strt = _f("ELEV"), _f("EGL"), _f("STRT")
+
+    kb = None
+    if elev_type == "KB" and elev is not None:
+        kb = elev
+    elif apd is not None:
+        kb = apd
+    elif edf is not None:
+        kb = edf
+    elif ekb is not None:
+        kb = ekb
+
+    result["kb_elevation_m"] = kb
+    result["ground_elevation_m"] = egl
+    result["log_start_md"] = strt
+    if kb is not None:
+        result["kb_elevation"] = kb
 
     return result
 
@@ -782,12 +814,12 @@ DEFAULT_VOLVE_GEOMETRY = SeismicSurveyGeometry(
 
 def build_well_trajectories(
     well_coords: Dict = None,
+    well_metadata: Optional[Dict] = None,
 ) -> Dict[str, WellTrajectory]:
     """
     Build WellTrajectory objects for Volve wells.
 
-    Currently assumes VERTICAL wells (no deviation survey loaded).
-    TODO: Load deviation surveys from well folders.
+    Uses per-well KB/GL/coordinates from prepared LAS metadata when available.
 
     Returns:
         {well_name: WellTrajectory}
@@ -795,20 +827,25 @@ def build_well_trajectories(
     if well_coords is None:
         well_coords = VOLVE_WELL_COORDS
 
-    # Real well elevations extracted from EOWR PDFs (RT=Rotary Table)
-    # RT to MSL = 54.9m for all Volve subsea template wells
-    # Water depth (MSL to Seabed) = 91m, RT to Seabed = 145.9m
-    REAL_KB = 54.9   # RT to MSL (Kelly Bushing elevation above Mean Sea Level)
-    REAL_WD = 91.0   # Water depth
+    DEFAULT_KB = 54.9   # Volve subsea template RT above MSL
+    DEFAULT_GL = -91.0  # Seabed below MSL
 
     trajectories = {}
     for well_name, (lat, lon) in well_coords.items():
+        meta = (well_metadata or {}).get(well_name, {})
+        kb = meta.get("kb_elevation_m", DEFAULT_KB)
+        gl = meta.get("ground_elevation_m", DEFAULT_GL)
+        if kb is None:
+            kb = DEFAULT_KB
+        if gl is None:
+            gl = DEFAULT_GL if abs(kb - 54.9) < 2.0 else 0.0
+
         trajectories[well_name] = WellTrajectory(
             well_name=well_name,
-            surface_lat=lat,
-            surface_lon=lon,
-            kb_elevation=REAL_KB,
-            ground_elevation=0.0,
+            surface_lat=meta.get("latitude", lat),
+            surface_lon=meta.get("longitude", lon),
+            kb_elevation=kb,
+            ground_elevation=gl,
         )
 
     return trajectories
