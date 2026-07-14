@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.model_config import ModelConfig
 from models.oil_gas_model import OilGasModelForPretraining
 from data.multimodal_dataset import CombinedMultimodalDataset, DEFAULT_FIELDS
+from data.seismic_patch_dataset import CombinedSeismicPatchDataset
 from scripts.train_pretrain_volve import PretrainTrainer, WELL_CURVES
 
 logging.basicConfig(
@@ -65,7 +66,19 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--stage2_from", type=str, default=None)
     parser.add_argument("--use-pretrained", action="store_true")
+    parser.add_argument(
+        "--no_stage1_split",
+        action="store_true",
+        help="Disable Stage1 split loaders (use paired samples for both MSM/MWM)",
+    )
+    parser.add_argument(
+        "--msm_patches_per_field",
+        type=int,
+        default=2000,
+        help="Seismic-only patches per field for Stage1 MSM",
+    )
     args = parser.parse_args()
+    args.stage1_split = not args.no_stage1_split
 
     device = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
     logger.info(f"Using device: {device}")
@@ -88,6 +101,40 @@ def main():
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0, drop_last=False
     )
+
+    msm_train_loader = None
+    msm_val_loader = None
+    if args.stage1_split:
+        msm_train_ds = CombinedSeismicPatchDataset.from_field_datasets(
+            train_ds.field_datasets,
+            patches_per_field=args.msm_patches_per_field,
+            seed=0,
+            deterministic=False,
+        )
+        msm_val_ds = CombinedSeismicPatchDataset.from_field_datasets(
+            val_ds.field_datasets,
+            patches_per_field=max(200, args.msm_patches_per_field // 5),
+            seed=1,
+            deterministic=True,
+        )
+        msm_train_loader = DataLoader(
+            msm_train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,
+            drop_last=True,
+        )
+        msm_val_loader = DataLoader(
+            msm_val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            drop_last=False,
+        )
+        logger.info(
+            f"Stage1 split loaders: MSM train={len(msm_train_ds)} patches, "
+            f"val={len(msm_val_ds)} patches | MWM train={len(train_ds)} well samples"
+        )
 
     config = ModelConfig()
     config.seismic_encoder.backbone = args.seismic_backbone
@@ -131,6 +178,8 @@ def main():
         config=trainer_config,
         device=device,
         seismic_patch_size=tuple(args.seismic_patch),
+        msm_train_loader=msm_train_loader,
+        msm_val_loader=msm_val_loader,
     )
 
     if args.resume:

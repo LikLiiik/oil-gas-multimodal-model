@@ -17,6 +17,7 @@ import sys
 import time
 import argparse
 import logging
+import itertools
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -55,10 +56,14 @@ class PretrainTrainer:
         config: dict,
         device: str = "cuda",
         seismic_patch_size: tuple = (32, 32, 32),
+        msm_train_loader: Optional[DataLoader] = None,
+        msm_val_loader: Optional[DataLoader] = None,
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.msm_train_loader = msm_train_loader
+        self.msm_val_loader = msm_val_loader
         self.config = config
         self.device = device
         self.seismic_patch_size = seismic_patch_size
@@ -79,6 +84,11 @@ class PretrainTrainer:
         self.current_epoch = 0
         self.training_stage = 1
         self._msm_decoder: Optional[nn.Module] = None
+
+    @property
+    def stage1_split(self) -> bool:
+        """True when MSM uses a dedicated seismic-only loader."""
+        return self.msm_train_loader is not None
 
     # ------------------------------------------------------------------
     # Stage setup
@@ -172,17 +182,43 @@ class PretrainTrainer:
     # ------------------------------------------------------------------
 
     def _parse_batch(self, batch: Dict) -> Dict[str, torch.Tensor]:
-        out = {
-            "seismic": batch["seismic"].to(self.device),
-            "well_log": batch["well_log"].to(self.device),
-        }
+        out: Dict[str, torch.Tensor] = {}
+        if "seismic" in batch:
+            out["seismic"] = batch["seismic"].to(self.device)
+        if "well_log" in batch:
+            out["well_log"] = batch["well_log"].to(self.device)
         if "well_mask" in batch:
             out["well_mask"] = batch["well_mask"].to(self.device)
         if "curve_mask" in batch:
             out["curve_mask"] = batch["curve_mask"].to(self.device)
         if "well_value_mask" in batch:
             out["well_value_mask"] = batch["well_value_mask"].to(self.device)
+        if "seismic_valid" in batch:
+            out["seismic_valid"] = batch["seismic_valid"].to(self.device).bool()
         return out
+
+    @staticmethod
+    def _select_valid_seismic(
+        seismic: torch.Tensor,
+        seismic_valid: Optional[torch.Tensor],
+        *extras: Optional[torch.Tensor],
+    ):
+        """Keep samples with real, non-degenerate seismic (drop zero-fill / flat pads)."""
+        # Drop only near-constant / zero-fill volumes. Per-patch MSM norm handles
+        # cross-field amplitude differences, so a mild energy gate is enough.
+        energy_ok = seismic.flatten(1).float().std(dim=1) > 1e-3
+        if seismic_valid is not None:
+            valid = seismic_valid.bool().view(-1) & energy_ok
+        else:
+            valid = energy_ok
+        if bool(valid.all()):
+            return (seismic,) + extras
+        if not bool(valid.any()):
+            return (None,) + tuple(None for _ in extras)
+        selected = [seismic[valid]]
+        for t in extras:
+            selected.append(t[valid] if t is not None else None)
+        return tuple(selected)
 
     def compute_pretrain_losses(self, batch: Dict) -> Dict[str, torch.Tensor]:
         if self.training_stage == 1:
@@ -196,19 +232,59 @@ class PretrainTrainer:
         well_mask = tensors.get("well_mask")
         curve_mask = tensors.get("curve_mask")
         value_mask = tensors.get("well_value_mask")
+        seismic_valid = tensors.get("seismic_valid")
 
-        msm_loss = self._compute_msm_loss(seismic)
+        msm_loss, msm_active = self._compute_msm_loss(seismic, seismic_valid)
         mwm_loss = self._compute_mwm_loss(
             well_log, curve_mask, well_mask, value_mask
         )
 
         weights = self.config.get("stage1_weights", {"msm": 1.0, "mwm": 1.0})
-        total = weights["msm"] * msm_loss + weights["mwm"] * mwm_loss
+        # When no usable seismic in the batch, train MWM only (don't dilute MSM).
+        total = weights["mwm"] * mwm_loss
+        if msm_active:
+            total = total + weights["msm"] * msm_loss
 
         return {
             "total_loss": total,
-            "msm_loss": msm_loss,
+            "msm_loss": msm_loss.detach() if not msm_active else msm_loss,
             "mwm_loss": mwm_loss,
+            "msm_active": torch.tensor(
+                1.0 if msm_active else 0.0, device=self.device
+            ),
+            "cmcl_loss": torch.tensor(0.0, device=self.device),
+            "swm_loss": torch.tensor(0.0, device=self.device),
+        }
+
+    def _compute_stage1_split_losses(
+        self, msm_batch: Dict, well_batch: Dict
+    ) -> Dict[str, torch.Tensor]:
+        """MSM from seismic-only batch; MWM from well batch (ignore its seismic)."""
+        msm_tensors = self._parse_batch(msm_batch)
+        well_tensors = self._parse_batch(well_batch)
+
+        msm_loss, msm_active = self._compute_msm_loss(
+            msm_tensors["seismic"], msm_tensors.get("seismic_valid")
+        )
+        mwm_loss = self._compute_mwm_loss(
+            well_tensors["well_log"],
+            well_tensors.get("curve_mask"),
+            well_tensors.get("well_mask"),
+            well_tensors.get("well_value_mask"),
+        )
+
+        weights = self.config.get("stage1_weights", {"msm": 1.0, "mwm": 1.0})
+        total = weights["mwm"] * mwm_loss
+        if msm_active:
+            total = total + weights["msm"] * msm_loss
+
+        return {
+            "total_loss": total,
+            "msm_loss": msm_loss.detach() if not msm_active else msm_loss,
+            "mwm_loss": mwm_loss,
+            "msm_active": torch.tensor(
+                1.0 if msm_active else 0.0, device=self.device
+            ),
             "cmcl_loss": torch.tensor(0.0, device=self.device),
             "swm_loss": torch.tensor(0.0, device=self.device),
         }
@@ -220,12 +296,28 @@ class PretrainTrainer:
         well_mask = tensors.get("well_mask")
         curve_mask = tensors.get("curve_mask")
         value_mask = tensors.get("well_value_mask")
+        seismic_valid = tensors.get("seismic_valid")
+
+        seismic_v, well_log_v, well_mask_v, curve_mask_v, value_mask_v = (
+            self._select_valid_seismic(
+                seismic, seismic_valid, well_log, well_mask, curve_mask, value_mask
+            )
+        )
+        if seismic_v is None or seismic_v.shape[0] < 2:
+            zero = seismic.sum() * 0.0
+            return {
+                "total_loss": zero,
+                "msm_loss": zero.detach(),
+                "mwm_loss": zero.detach(),
+                "cmcl_loss": zero.detach(),
+                "swm_loss": zero.detach(),
+            }
 
         cmcl_loss = self._compute_fusion_cmcl_loss(
-            seismic, well_log, curve_mask, well_mask, value_mask
+            seismic_v, well_log_v, curve_mask_v, well_mask_v, value_mask_v
         )
         swm_loss = self._compute_fusion_swm_loss(
-            seismic, well_log, curve_mask, well_mask, value_mask
+            seismic_v, well_log_v, curve_mask_v, well_mask_v, value_mask_v
         )
 
         weights = self.config.get("stage2_weights", {"cmcl": 0.5, "swm": 0.3})
@@ -239,21 +331,29 @@ class PretrainTrainer:
             "swm_loss": swm_loss,
         }
 
-    def _compute_msm_loss(self, seismic: torch.Tensor) -> torch.Tensor:
+    def _compute_msm_loss(
+        self,
+        seismic: torch.Tensor,
+        seismic_valid: Optional[torch.Tensor] = None,
+    ):
+        seismic_v, = self._select_valid_seismic(seismic, seismic_valid)
+        if seismic_v is None:
+            # All-zero / flat fallback batch: do not train MSM.
+            return seismic.sum() * 0.0, False
+
         seis_encoder = self.model.seismic_encoder
         if hasattr(seis_encoder, "forward_mae"):
             self._ensure_msm_decoder()
             result = seis_encoder.forward_mae(
-                seismic, self._msm_decoder, mask_ratio=0.6
+                seismic_v, self._msm_decoder, mask_ratio=0.6
             )
-            return result["loss"]
+            return result["loss"], True
 
-        b = seismic.shape[0]
         with autocast(enabled=self.use_amp):
-            full_feat, _ = seis_encoder(seismic, return_features=False)
-            masked_input = seismic * (torch.rand_like(seismic) > 0.6)
+            full_feat, _ = seis_encoder(seismic_v, return_features=False)
+            masked_input = seismic_v * (torch.rand_like(seismic_v) > 0.6)
             masked_feat, _ = seis_encoder(masked_input, return_features=False)
-        return F.mse_loss(masked_feat, full_feat)
+        return F.mse_loss(masked_feat, full_feat), True
 
     def _compute_mwm_loss(
         self,
@@ -385,9 +485,17 @@ class PretrainTrainer:
         epoch_metrics: Dict[str, float] = {}
         num_batches = len(self.train_loader)
         accum = self.config.get("accumulate_grad", 2)
+        msm_iter = (
+            itertools.cycle(self.msm_train_loader)
+            if self.training_stage == 1 and self.stage1_split
+            else None
+        )
 
         for batch_idx, batch in enumerate(self.train_loader):
-            losses = self.compute_pretrain_losses(batch)
+            if msm_iter is not None:
+                losses = self._compute_stage1_split_losses(next(msm_iter), batch)
+            else:
+                losses = self.compute_pretrain_losses(batch)
             loss = losses["total_loss"] / accum
 
             if self.use_amp and self.scaler:
@@ -412,6 +520,14 @@ class PretrainTrainer:
                 self.scheduler.step()
 
             for k, v in losses.items():
+                if k == "msm_active":
+                    epoch_metrics[k] = epoch_metrics.get(k, 0.0) + v.item()
+                    continue
+                if k == "msm_loss":
+                    if losses.get("msm_active", torch.tensor(1.0)).item() > 0.5:
+                        epoch_metrics[k] = epoch_metrics.get(k, 0.0) + v.item()
+                        epoch_metrics["_msm_n"] = epoch_metrics.get("_msm_n", 0.0) + 1.0
+                    continue
                 epoch_metrics[k] = epoch_metrics.get(k, 0.0) + v.item()
 
             if batch_idx % self.config.get("log_interval", 10) == 0:
@@ -422,7 +538,9 @@ class PretrainTrainer:
                         f"Batch {batch_idx}/{num_batches} | "
                         f"Total: {loss.item()*accum:.4f} | "
                         f"MSM: {losses['msm_loss'].item():.4f} | "
-                        f"MWM: {losses['mwm_loss'].item():.4f} | LR: {lr:.6f}"
+                        f"MWM: {losses['mwm_loss'].item():.4f} | "
+                        f"seis_ok: {int(losses.get('msm_active', torch.tensor(1.0)).item())} | "
+                        f"LR: {lr:.6f}"
                     )
                 else:
                     logger.info(
@@ -438,7 +556,19 @@ class PretrainTrainer:
 
             self.global_step += 1
 
-        return {k: v / num_batches for k, v in epoch_metrics.items()}
+        out: Dict[str, float] = {}
+        msm_n = epoch_metrics.pop("_msm_n", 0.0)
+        epoch_metrics.pop("msm_active", None)
+        for k, v in epoch_metrics.items():
+            if k == "msm_loss":
+                out[k] = v / max(msm_n, 1.0)
+            else:
+                out[k] = v / num_batches
+        if "msm_loss" in out and "mwm_loss" in out:
+            w = self.config.get("stage1_weights", {"msm": 1.0, "mwm": 1.0})
+            out["total_loss"] = w["msm"] * out["msm_loss"] + w["mwm"] * out["mwm_loss"]
+        out["msm_valid_frac"] = msm_n / max(num_batches, 1)
+        return out
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
@@ -449,13 +579,48 @@ class PretrainTrainer:
         if self._msm_decoder is not None:
             self._msm_decoder.eval()
         metrics: Dict[str, float] = {}
-        with torch.no_grad():
-            for batch in self.val_loader:
-                losses = self.compute_pretrain_losses(batch)
-                for k, v in losses.items():
-                    metrics[k] = metrics.get(k, 0.0) + v.item()
         n = len(self.val_loader)
-        return {k: v / n for k, v in metrics.items()}
+        with torch.no_grad():
+            if self.training_stage == 1 and self.msm_val_loader is not None:
+                msm_iter = itertools.cycle(self.msm_val_loader)
+                for batch in self.val_loader:
+                    losses = self._compute_stage1_split_losses(next(msm_iter), batch)
+                    for k, v in losses.items():
+                        if k == "msm_active":
+                            metrics[k] = metrics.get(k, 0.0) + v.item()
+                            continue
+                        if k == "msm_loss":
+                            if losses.get("msm_active", torch.tensor(1.0)).item() > 0.5:
+                                metrics[k] = metrics.get(k, 0.0) + v.item()
+                                metrics["_msm_n"] = metrics.get("_msm_n", 0.0) + 1.0
+                            continue
+                        metrics[k] = metrics.get(k, 0.0) + v.item()
+            else:
+                for batch in self.val_loader:
+                    losses = self.compute_pretrain_losses(batch)
+                    for k, v in losses.items():
+                        if k == "msm_active":
+                            metrics[k] = metrics.get(k, 0.0) + v.item()
+                            continue
+                        if k == "msm_loss":
+                            if losses.get("msm_active", torch.tensor(1.0)).item() > 0.5:
+                                metrics[k] = metrics.get(k, 0.0) + v.item()
+                                metrics["_msm_n"] = metrics.get("_msm_n", 0.0) + 1.0
+                            continue
+                        metrics[k] = metrics.get(k, 0.0) + v.item()
+        out: Dict[str, float] = {}
+        msm_n = metrics.pop("_msm_n", 0.0)
+        metrics.pop("msm_active", None)
+        for k, v in metrics.items():
+            if k == "msm_loss":
+                out[k] = v / max(msm_n, 1.0)
+            else:
+                out[k] = v / n
+        if "msm_loss" in out and "mwm_loss" in out:
+            w = self.config.get("stage1_weights", {"msm": 1.0, "mwm": 1.0})
+            out["total_loss"] = w["msm"] * out["msm_loss"] + w["mwm"] * out["mwm_loss"]
+        out["msm_valid_frac"] = msm_n / max(n, 1)
+        return out
 
     def fit_stage(self, epochs: int, stage: int) -> Dict:
         self.setup_stage(stage, epochs)
@@ -485,7 +650,8 @@ class PretrainTrainer:
                     logger.info(
                         f"  Val Total: {val_loss:.4f} | "
                         f"MSM: {val_metrics.get('msm_loss', 0):.4f} | "
-                        f"MWM: {val_metrics.get('mwm_loss', 0):.4f}"
+                        f"MWM: {val_metrics.get('mwm_loss', 0):.4f} | "
+                        f"seis_frac: {val_metrics.get('msm_valid_frac', 0):.2f}"
                     )
                 else:
                     logger.info(

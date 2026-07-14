@@ -298,7 +298,12 @@ class FieldDataset(Dataset):
         depth_end = sample["depth_end"]
 
         seis_patch = self._extract_seismic_patch(well_name, depth_start, depth_end)
-        if seis_patch is None:
+        # Reject missing or near-constant patches (zero-fill / heavy pad → trivial MSM).
+        seismic_valid = (
+            seis_patch is not None and float(np.nanstd(seis_patch)) > 1e-6
+        )
+        if not seismic_valid:
+            # Keep tensor shape for collation; MSM/CMCL must skip via seismic_valid.
             seis_patch = np.zeros(
                 (self.seismic_patch_size[1], self.seismic_patch_size[2], self.seismic_patch_size[0]),
                 dtype=np.float32,
@@ -355,6 +360,7 @@ class FieldDataset(Dataset):
 
         return {
             "seismic": seis_tensor,
+            "seismic_valid": torch.tensor(seismic_valid, dtype=torch.bool),
             "well_log": torch.from_numpy(np.stack(well_curves_arr)).float(),
             "well_mask": torch.from_numpy(well_mask).float(),
             "curve_mask": torch.tensor(curve_mask_arr, dtype=torch.float32),

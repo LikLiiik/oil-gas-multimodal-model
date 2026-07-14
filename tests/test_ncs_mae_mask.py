@@ -54,7 +54,46 @@ def test_merge_norm_stats_pooled_std():
     assert abs(stats["seismic_std"] - (2.0 ** 0.5 + 1e-8)) < 1e-5
 
 
+def test_msm_skips_invalid_seismic():
+    """Constant zero-fill patches must not contribute to MSM loss."""
+    from types import SimpleNamespace
+
+    from scripts.train_pretrain_volve import PretrainTrainer
+
+    class DummySeis(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward_mae(self, seismic, decoder, mask_ratio=0.6):
+            self.calls += 1
+            assert seismic.shape[0] == 1
+            return {"loss": torch.tensor(2.5, requires_grad=True)}
+
+    model = SimpleNamespace(seismic_encoder=DummySeis())
+    trainer = PretrainTrainer.__new__(PretrainTrainer)
+    trainer.model = model
+    trainer.device = "cpu"
+    trainer.use_amp = False
+    trainer._msm_decoder = object()
+
+    seismic = torch.randn(3, 1, 4, 4, 4)
+    valid = torch.tensor([False, True, False])
+    loss, active = trainer._compute_msm_loss(seismic, valid)
+    assert active
+    assert abs(loss.item() - 2.5) < 1e-6
+    assert model.seismic_encoder.calls == 1
+
+    loss_none, active_none = trainer._compute_msm_loss(
+        seismic, torch.zeros(3, dtype=torch.bool)
+    )
+    assert not active_none
+    assert abs(loss_none.item()) < 1e-8
+    assert model.seismic_encoder.calls == 1
+
+
 if __name__ == "__main__":
     test_forward_mae_encoder_mask_matches_ids_keep()
     test_merge_norm_stats_pooled_std()
+    test_msm_skips_invalid_seismic()
     print("ok")

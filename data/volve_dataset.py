@@ -1017,7 +1017,11 @@ class VolveDataset(Dataset):
 
         # Seismic patch at ACTUAL well position
         seis_patch = self._extract_seismic_patch(well_name, md_center)
-        if seis_patch is None:
+        seismic_valid = (
+            seis_patch is not None and float(np.nanstd(seis_patch)) > 1e-6
+        )
+        if not seismic_valid:
+            # Keep tensor shape for collation; MSM/CMCL must skip via seismic_valid.
             seis_patch = np.zeros(
                 (self.seismic_patch_size[1], self.seismic_patch_size[2],
                  self.seismic_patch_size[0]), dtype=np.float32
@@ -1085,6 +1089,7 @@ class VolveDataset(Dataset):
 
         return {
             "seismic": seis_tensor,
+            "seismic_valid": torch.tensor(seismic_valid, dtype=torch.bool),
             "well_log": well_tensor,
             "well_mask": mask_tensor,
             "curve_mask": curve_mask_tensor,

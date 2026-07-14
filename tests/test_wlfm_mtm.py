@@ -145,13 +145,14 @@ def test_trainer_stage1_passes_value_mask():
     trainer.training_stage = 1
     trainer._msm_decoder = None
 
-    def fake_msm(_seismic):
-        return torch.tensor(0.5)
+    def fake_msm(*_args, **_kwargs):
+        return torch.tensor(0.5), True
 
     trainer._compute_msm_loss = fake_msm
 
     batch = {
         "seismic": torch.randn(2, 1, 8, 8, 8),
+        "seismic_valid": torch.tensor([True, False]),
         "well_log": torch.randn(2, 3, 32),
         "well_mask": torch.ones(2, 32),
         "curve_mask": torch.ones(2, 3),

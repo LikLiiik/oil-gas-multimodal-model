@@ -1047,6 +1047,12 @@ class NCSSeismicEncoder3D(nn.Module):
         # Compute target (original pixel values for each patch)
         target = self._patchify(x)  # (B, N, patch_dim)
 
+        # Per-patch normalization (MAE norm_pix_loss): makes MSM scale-invariant
+        # across fields / amplitude ranges so low-energy volumes don't dominate.
+        mean = target.mean(dim=-1, keepdim=True)
+        var = target.var(dim=-1, keepdim=True)
+        target = (target - mean) / (var + 1e-6).sqrt()
+
         # Reconstruction loss (only on masked patches)
         loss = F.mse_loss(pred[mask], target[mask])
 
