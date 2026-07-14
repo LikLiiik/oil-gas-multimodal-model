@@ -68,12 +68,14 @@ class VectorQuantizer(nn.Module):
         embedding_dim: int = 256,
         commitment_cost: float = 0.25,
         decay: float = 0.99,
+        dead_code_threshold: float = 0.5,
     ):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.commitment_cost = commitment_cost
         self.decay = decay
+        self.dead_code_threshold = dead_code_threshold
 
         # Codebook
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
@@ -83,7 +85,10 @@ class VectorQuantizer(nn.Module):
 
         # EMA tracking buffers (not parameters)
         self.register_buffer("ema_cluster_size", torch.zeros(num_embeddings))
-        self.register_buffer("ema_w", self.embedding.weight.data.clone())
+        # Accumulate encoder vectors only. Initializing this from the random
+        # codebook makes never-used entries explode when divided by an almost
+        # zero EMA cluster size.
+        self.register_buffer("ema_w", torch.zeros_like(self.embedding.weight.data))
 
     def forward(
         self, z: torch.Tensor
@@ -117,12 +122,9 @@ class VectorQuantizer(nn.Module):
         # Straight-through estimator
         z_q_st = z + (z_q - z).detach()
 
-        # Losses
-        # Commitment loss: encoder should commit to a codebook entry
-        commitment_loss = self.commitment_cost * F.mse_loss(z_q_st, z.detach())
-
-        # Codebook loss: codebook entries should move toward encoder outputs
-        # (handled by EMA updates during training, but compute for logging)
+        # Commitment loss: encoder outputs must move toward codebook entries.
+        # EMA already updates the codebook, so only β ||z - sg[e]||^2 is needed.
+        commitment_loss = self.commitment_cost * F.mse_loss(z, z_q.detach())
 
         # Update EMA buffers (only during training)
         if self.training:
@@ -137,16 +139,42 @@ class VectorQuantizer(nn.Module):
                 dw = torch.matmul(encodings.t(), z_flat)  # (K, D)
                 self.ema_w.data.mul_(self.decay).add_(dw, alpha=1 - self.decay)
 
-                # Laplace smoothing of cluster sizes
-                n = torch.sum(self.ema_cluster_size)
-                cluster_size = (
-                    (self.ema_cluster_size + 1e-5) /
-                    (n + self.num_embeddings * 1e-5) * n
-                )
+                # Only update entries that have actually received assignments.
+                # Keeping unused entries at their finite random initialization
+                # lets them become active later and avoids inf/huge vectors.
+                active = self.ema_cluster_size > 1e-5
+                if active.any():
+                    embed_normalized = (
+                        self.ema_w[active]
+                        / self.ema_cluster_size[active].unsqueeze(1).clamp_min(1e-5)
+                    )
+                    self.embedding.weight.data[active].copy_(embed_normalized)
 
-                # Normalize and update embedding weights
-                embed_normalized = self.ema_w / cluster_size.unsqueeze(1)
-                self.embedding.weight.data.copy_(embed_normalized)
+                # Revive dead codes by reinitializing them from random encoder
+                # outputs. Without this the codebook collapses to a handful of
+                # entries and MTM validation CE stops improving.
+                dead = self.ema_cluster_size < self.dead_code_threshold
+                n_dead = int(dead.sum().item())
+                if n_dead > 0 and z_flat.shape[0] > 0:
+                    rand_idx = torch.randint(
+                        0, z_flat.shape[0], (n_dead,), device=z_flat.device
+                    )
+                    # Use .data.dtype: under AMP, Embedding weight views may
+                    # look like fp16 while the parameter storage stays fp32.
+                    embed_dtype = self.embedding.weight.data.dtype
+                    resurrected = (
+                        z_flat[rand_idx].float().to(embed_dtype)
+                        + 0.01
+                        * torch.randn(
+                            n_dead,
+                            D,
+                            device=z_flat.device,
+                            dtype=embed_dtype,
+                        )
+                    )
+                    self.embedding.weight.data[dead].copy_(resurrected)
+                    self.ema_w.data[dead].copy_(resurrected)
+                    self.ema_cluster_size.data[dead] = 1.0
 
         # VQ loss
         vq_loss = commitment_loss
@@ -720,6 +748,8 @@ class WLFMWellLogEncoder1D(nn.Module):
         self,
         x: torch.Tensor,
         curve_mask: Optional[torch.Tensor] = None,
+        depth_mask: Optional[torch.Tensor] = None,
+        value_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Per-well z-score normalization (following WLFM).
@@ -727,6 +757,8 @@ class WLFMWellLogEncoder1D(nn.Module):
         Args:
             x: (B, C, L) well log curves
             curve_mask: Optional (B, C) binary mask, 1=valid curve
+            depth_mask: Optional (B, L) binary mask, 1=valid depth sample
+            value_mask: Optional (B, C, L) per-value validity mask
         Returns:
             normalized curves
         """
@@ -734,6 +766,10 @@ class WLFMWellLogEncoder1D(nn.Module):
             mask = curve_mask.unsqueeze(-1).expand_as(x)
         else:
             mask = (x != 0).float()
+        if depth_mask is not None:
+            mask = mask * depth_mask.unsqueeze(1).expand_as(x)
+        if value_mask is not None:
+            mask = mask * value_mask.float()
 
         mean = (x * mask).sum(dim=2, keepdim=True) / (mask.sum(dim=2, keepdim=True) + 1e-8)
         var = ((x - mean) * mask).pow(2).sum(dim=2, keepdim=True) / (mask.sum(dim=2, keepdim=True) + 1e-8)
@@ -747,6 +783,8 @@ class WLFMWellLogEncoder1D(nn.Module):
         self,
         x: torch.Tensor,
         curve_mask: Optional[torch.Tensor] = None,
+        depth_mask: Optional[torch.Tensor] = None,
+        value_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Tokenize well log sequences into discrete geological tokens.
@@ -766,26 +804,24 @@ class WLFMWellLogEncoder1D(nn.Module):
         x = self._apply_curve_mask(x, curve_mask)
 
         # Per-well normalization
-        x_norm = self._per_well_normalize(x, curve_mask=curve_mask)
+        x_norm = self._per_well_normalize(
+            x,
+            curve_mask=curve_mask,
+            depth_mask=depth_mask,
+            value_mask=value_mask,
+        )
 
         # Segment into patches
         patches, P = self._segment_patches(x_norm)  # (B, P, C, patch_len)
 
-        # Tokenize each patch
-        all_tokens = []
-        all_indices = []
-        total_vq_loss = 0.0
-
-        for p in range(P):
-            patch = patches[:, p, :, :]  # (B, C, patch_len)
-            result = self.tokenizer(patch, return_indices=True)
-            all_tokens.append(result["tokens"].squeeze(1))  # (B, vq_embed_dim)
-            all_indices.append(result["indices"].squeeze(1))  # (B,)
-            total_vq_loss += result["vq_loss"]
-
-        tokens = torch.stack(all_tokens, dim=1)  # (B, P, vq_embed_dim)
-        indices = torch.stack(all_indices, dim=1)  # (B, P)
-        vq_loss = total_vq_loss / P
+        # Tokenize all patches in one VQ batch so the EMA codebook sees B*P
+        # vectors per step instead of only B (strongly reduces collapse).
+        Bp = B * P
+        flat_patches = patches.reshape(Bp, C, self.patch_len)
+        result = self.tokenizer(flat_patches, return_indices=True)
+        tokens = result["tokens"].squeeze(1).view(B, P, -1)
+        indices = result["indices"].squeeze(1).view(B, P)
+        vq_loss = result["vq_loss"]
 
         return {
             "tokens": tokens,
@@ -799,6 +835,7 @@ class WLFMWellLogEncoder1D(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         curve_mask: Optional[torch.Tensor] = None,
+        value_mask: Optional[torch.Tensor] = None,
         return_sequence: bool = False,
         return_token_info: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -809,6 +846,7 @@ class WLFMWellLogEncoder1D(nn.Module):
             x: (B, C, L) well log curves
             mask: Optional (B, L) depth mask (adapted to patch level)
             curve_mask: Optional (B, C) binary mask, 1=valid curve, 0=missing
+            value_mask: Optional (B, C, L) per-value validity mask
             return_sequence: Return full patch sequence features
             return_token_info: Return tokenization details
 
@@ -819,21 +857,28 @@ class WLFMWellLogEncoder1D(nn.Module):
         x = self._apply_curve_mask(x, curve_mask)
 
         # Per-well normalization
-        x_norm = self._per_well_normalize(x, curve_mask=curve_mask)
+        x_norm = self._per_well_normalize(
+            x,
+            curve_mask=curve_mask,
+            depth_mask=mask,
+            value_mask=value_mask,
+        )
 
         # Segment into patches
         patches, P = self._segment_patches(x_norm)  # (B, P, C, patch_len)
 
         # Tokenize patches through VQ-VAE
-        tokenized = self.tokenize(x, curve_mask=curve_mask)
+        tokenized = self.tokenize(
+            x,
+            curve_mask=curve_mask,
+            depth_mask=mask,
+            value_mask=value_mask,
+        )
         tokens = tokenized["tokens"]  # (B, P, vq_embed_dim)
         vq_loss = tokenized["vq_loss"]
 
         # Project tokens to transformer dimension
         seq_feat = self.token_proj(tokens)  # (B, P, embed_dim)
-
-        # Add depth positional encoding
-        seq_feat = self.depth_encoding(seq_feat)
 
         # Physical constraint encoding (optional)
         if self.use_physics_constraint and self.physics_encoder is not None:
@@ -847,6 +892,10 @@ class WLFMWellLogEncoder1D(nn.Module):
             seq_feat = self.phys_fuse(
                 torch.cat([seq_feat, phys_features], dim=-1)
             )
+
+        # Position is added after modality-specific fusion so Stage 1 MTM and
+        # the regular encoder consume the same representation distribution.
+        seq_feat = self.depth_encoding(seq_feat)
 
         # Adapt mask to patch level
         attn_mask = None
@@ -877,6 +926,8 @@ class WLFMWellLogEncoder1D(nn.Module):
         x: torch.Tensor,
         mask_ratio: float = 0.5,
         curve_mask: Optional[torch.Tensor] = None,
+        depth_mask: Optional[torch.Tensor] = None,
+        value_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Masked Token Modeling (MTM) forward pass.
@@ -888,6 +939,9 @@ class WLFMWellLogEncoder1D(nn.Module):
         Args:
             x: (B, C, L) well log curves
             mask_ratio: Fraction of patches to mask (default 0.5)
+            curve_mask: Optional (B, C) available-curve mask
+            depth_mask: Optional (B, L) valid-depth mask
+            value_mask: Optional (B, C, L) per-value validity mask
 
         Returns:
             dict with:
@@ -901,77 +955,118 @@ class WLFMWellLogEncoder1D(nn.Module):
         x = self._apply_curve_mask(x, curve_mask)
 
         # Normalize and segment
-        x_norm = self._per_well_normalize(x, curve_mask=curve_mask)
+        x_norm = self._per_well_normalize(
+            x,
+            curve_mask=curve_mask,
+            depth_mask=depth_mask,
+            value_mask=value_mask,
+        )
         patches, P = self._segment_patches(x_norm)
 
         # Tokenize all patches (get ground truth indices)
-        tokenized = self.tokenize(x, curve_mask=curve_mask)
-        target_indices = tokenized["indices"]  # (B, P)
+        tokenized = self.tokenize(
+            x,
+            curve_mask=curve_mask,
+            depth_mask=depth_mask,
+            value_mask=value_mask,
+        )
+        target_indices = tokenized["indices"].detach()  # (B, P)
         tokens = tokenized["tokens"]  # (B, P, vq_embed_dim)
 
-        # Patches with no valid curves should not contribute to MTM loss
-        if curve_mask is not None:
-            patch_curve_mask = curve_mask.unsqueeze(1).expand(-1, P, -1)  # (B, P, C)
-            patch_valid = (patches.abs() * patch_curve_mask.unsqueeze(-1)).sum(dim=(2, 3)) > 1e-6
+        # Patches without valid depth samples must not contribute to MTM.
+        if value_mask is not None:
+            patch_valid = F.max_pool1d(
+                value_mask.float(),
+                self.patch_len,
+                self.patch_stride,
+            ).amax(dim=1) > 0
+        elif depth_mask is not None:
+            patch_valid = F.max_pool1d(
+                depth_mask.float().unsqueeze(1),
+                self.patch_len,
+                self.patch_stride,
+            ).squeeze(1) > 0
         else:
             patch_valid = patches.abs().sum(dim=(2, 3)) > 1e-6
+        if curve_mask is not None:
+            patch_valid = patch_valid & curve_mask.bool().any(dim=1, keepdim=True)
 
-        # Random masking
-        num_mask = int(P * mask_ratio)
-        noise = torch.rand(B, P, device=x.device)
-        ids_shuffle = torch.argsort(noise, dim=1)
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-
-        # Mask
+        # Select random valid patches without changing sequence order. The old
+        # implementation shuffled tokens but compared them with unshuffled
+        # targets, making the classification labels incorrect.
         mask = torch.zeros(B, P, device=x.device, dtype=torch.bool)
-        mask[:, :num_mask] = True
-        # Shuffle mask to match shuffled order
-        mask_shuffled = torch.gather(mask, dim=1, index=ids_shuffle)
+        noise = torch.rand(B, P, device=x.device)
+        for b in range(B):
+            valid_indices = torch.where(patch_valid[b])[0]
+            if valid_indices.numel() == 0:
+                continue
+            num_mask = max(1, int(valid_indices.numel() * mask_ratio))
+            num_mask = min(num_mask, valid_indices.numel())
+            chosen = valid_indices[
+                torch.argsort(noise[b, valid_indices])[:num_mask]
+            ]
+            mask[b, chosen] = True
 
-        # Replace masked tokens with learnable mask token
-        tokens_proj = self.token_proj(tokens)  # (B, P, embed_dim)
-
-        # Shuffle tokens
-        idx_expand = ids_shuffle.unsqueeze(-1).expand(-1, -1, self.embed_dim)
-        tokens_shuffled = torch.gather(tokens_proj, dim=1, index=idx_expand)
+        # Build the same token + physics representation used by forward().
+        seq_feat = self.token_proj(tokens)  # (B, P, embed_dim)
+        if self.use_physics_constraint and self.physics_encoder is not None:
+            phys_features = torch.stack(
+                [
+                    self.physics_encoder(patches[:, p].mean(dim=-1))
+                    for p in range(P)
+                ],
+                dim=1,
+            )
+            seq_feat = self.phys_fuse(
+                torch.cat([seq_feat, phys_features], dim=-1)
+            )
 
         # Replace masked positions with mask token
         mask_token_expanded = self.mask_token.expand(B, P, -1)
-        tokens_shuffled = torch.where(
-            mask_shuffled.unsqueeze(-1), mask_token_expanded, tokens_shuffled
+        seq_feat = torch.where(
+            mask.unsqueeze(-1), mask_token_expanded, seq_feat
         )
 
-        # Add position encoding
-        tokens_shuffled = self.depth_encoding(tokens_shuffled)
+        seq_feat = self.depth_encoding(seq_feat)
 
         # Encode through transformer
-        seq_feat = tokens_shuffled
         for blk in self.transformer_blocks:
             seq_feat = blk(seq_feat)
         seq_feat = self.encoder_norm(seq_feat)
 
-        # Predict token indices
-        logits = self.mtm_head(seq_feat)  # (B, P, num_embeddings)
+        # Make MTM depend on the same global representation consumed by Stage
+        # 2, so attention pooling and global projection are pretrained too.
+        pooling_mask = patch_valid.clone()
+        empty = ~pooling_mask.any(dim=1)
+        if empty.any():
+            pooling_mask[empty] = True
+        global_feat = self.attn_pool(seq_feat, pooling_mask.float())
+        global_feat = self.output_norm(self.global_proj(global_feat))
+        logits = self.mtm_head(
+            seq_feat + global_feat.unsqueeze(1)
+        )  # (B, P, num_embeddings)
 
-        # Compute loss (only on masked positions with valid curves)
-        train_mask = mask_shuffled & patch_valid
+        # Compute loss on aligned masked positions and include the tokenizer's
+        # commitment loss to prevent encoder/codebook drift.
+        train_mask = mask & patch_valid
         if train_mask.any():
-            loss = F.cross_entropy(
+            mtm_loss = F.cross_entropy(
                 logits[train_mask],
                 target_indices[train_mask],
             )
         else:
-            loss = logits.sum() * 0.0
-
-        # Restore original order
-        idx_restore_expand = ids_restore.unsqueeze(-1).expand(-1, -1, logits.shape[-1])
-        logits_restored = torch.gather(logits, dim=1, index=idx_restore_expand)
+            mtm_loss = logits.sum() * 0.0
+        vq_loss = tokenized["vq_loss"]
+        loss = mtm_loss + vq_loss
 
         return {
-            "logits": logits_restored,
+            "logits": logits,
             "target_indices": target_indices,
             "mask": mask,
             "loss": loss,
+            "mtm_loss": mtm_loss,
+            "vq_loss": vq_loss,
+            "patch_valid": patch_valid,
         }
 
     def forward_scl(

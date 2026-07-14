@@ -410,13 +410,12 @@ class OilGasModelForPretraining(nn.Module):
             nn.Linear(hidden_dim, proj_dim),
         )
 
-        # Matching classifier for SWM
+        # Matching classifier for SWM (logits; use BCEWithLogitsLoss)
         self.matching_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),
         )
 
         self.fusion_module = CrossModalFusion(
@@ -487,11 +486,10 @@ class OilGasModelForPretraining(nn.Module):
 
         seis_proj, well_proj = self.modality_proj(seis_global, well_global)
 
-        # Concatenate and classify
+        # Concatenate and classify (return probability for API compatibility)
         combined = torch.cat([seis_proj, well_proj], dim=-1)
-        match_prob = self.matching_head(combined)
-
-        return match_prob
+        match_logits = self.matching_head(combined)
+        return torch.sigmoid(match_logits)
 
     def forward(
         self,

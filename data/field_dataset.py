@@ -308,25 +308,30 @@ class FieldDataset(Dataset):
         seis_tensor = torch.from_numpy(seis_patch.copy()).float().unsqueeze(0)
 
         well_seq = self._extract_well_sequence(well_name, depth_start)
-        well_curves_arr, curve_mask_arr = [], []
-        well_mask = np.ones(self.well_seq_len, dtype=np.float32)
+        well_curves_arr, curve_mask_arr, value_mask_arr = [], [], []
+        well_mask = np.zeros(self.well_seq_len, dtype=np.float32)
 
         for curve_name in self.well_curves:
             if well_seq is not None and curve_name in well_seq:
                 raw = well_seq[curve_name]
                 valid = ~np.isnan(raw)
+                value_mask_arr.append(valid.astype(np.float32))
                 if np.any(valid):
                     curve_mask_arr.append(1.0)
                     mean = self.norm_stats.get(f"{curve_name}_mean", 0)
                     std = self.norm_stats.get(f"{curve_name}_std", 1)
-                    vals = np.where(valid, raw, 0.0)
-                    vals = (vals - mean) / std
-                    well_mask = well_mask * valid.astype(np.float32)
+                    vals = np.where(valid, (raw - mean) / std, 0.0)
+                    well_mask = np.maximum(
+                        well_mask, valid.astype(np.float32)
+                    )
                 else:
                     curve_mask_arr.append(0.0)
                     vals = np.zeros(self.well_seq_len, dtype=np.float32)
             else:
                 curve_mask_arr.append(0.0)
+                value_mask_arr.append(
+                    np.zeros(self.well_seq_len, dtype=np.float32)
+                )
                 vals = np.zeros(self.well_seq_len, dtype=np.float32)
             well_curves_arr.append(vals)
 
@@ -352,6 +357,9 @@ class FieldDataset(Dataset):
             "well_log": torch.from_numpy(np.stack(well_curves_arr)).float(),
             "well_mask": torch.from_numpy(well_mask).float(),
             "curve_mask": torch.tensor(curve_mask_arr, dtype=torch.float32),
+            "well_value_mask": torch.from_numpy(
+                np.stack(value_mask_arr)
+            ).float(),
             "labels": labels,
             "well_name": well_name,
             "field": self.field,

@@ -180,6 +180,8 @@ class PretrainTrainer:
             out["well_mask"] = batch["well_mask"].to(self.device)
         if "curve_mask" in batch:
             out["curve_mask"] = batch["curve_mask"].to(self.device)
+        if "well_value_mask" in batch:
+            out["well_value_mask"] = batch["well_value_mask"].to(self.device)
         return out
 
     def compute_pretrain_losses(self, batch: Dict) -> Dict[str, torch.Tensor]:
@@ -191,10 +193,14 @@ class PretrainTrainer:
         tensors = self._parse_batch(batch)
         seismic = tensors["seismic"]
         well_log = tensors["well_log"]
+        well_mask = tensors.get("well_mask")
         curve_mask = tensors.get("curve_mask")
+        value_mask = tensors.get("well_value_mask")
 
         msm_loss = self._compute_msm_loss(seismic)
-        mwm_loss = self._compute_mwm_loss(well_log, curve_mask)
+        mwm_loss = self._compute_mwm_loss(
+            well_log, curve_mask, well_mask, value_mask
+        )
 
         weights = self.config.get("stage1_weights", {"msm": 1.0, "mwm": 1.0})
         total = weights["msm"] * msm_loss + weights["mwm"] * mwm_loss
@@ -211,10 +217,16 @@ class PretrainTrainer:
         tensors = self._parse_batch(batch)
         seismic = tensors["seismic"]
         well_log = tensors["well_log"]
+        well_mask = tensors.get("well_mask")
         curve_mask = tensors.get("curve_mask")
+        value_mask = tensors.get("well_value_mask")
 
-        cmcl_loss = self._compute_fusion_cmcl_loss(seismic, well_log, curve_mask)
-        swm_loss = self._compute_fusion_swm_loss(seismic, well_log, curve_mask)
+        cmcl_loss = self._compute_fusion_cmcl_loss(
+            seismic, well_log, curve_mask, well_mask, value_mask
+        )
+        swm_loss = self._compute_fusion_swm_loss(
+            seismic, well_log, curve_mask, well_mask, value_mask
+        )
 
         weights = self.config.get("stage2_weights", {"cmcl": 0.5, "swm": 0.3})
         total = weights["cmcl"] * cmcl_loss + weights["swm"] * swm_loss
@@ -247,12 +259,18 @@ class PretrainTrainer:
         self,
         well_log: torch.Tensor,
         curve_mask: Optional[torch.Tensor],
+        well_mask: Optional[torch.Tensor],
+        value_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         wl_encoder = self.model.well_log_encoder
         if hasattr(wl_encoder, "forward_mtm"):
             with autocast(enabled=self.use_amp):
                 result = wl_encoder.forward_mtm(
-                    well_log, mask_ratio=0.5, curve_mask=curve_mask
+                    well_log,
+                    mask_ratio=0.5,
+                    curve_mask=curve_mask,
+                    depth_mask=well_mask,
+                    value_mask=value_mask,
                 )
                 return result["loss"]
         return torch.tensor(0.0, device=self.device, requires_grad=True)
@@ -262,6 +280,8 @@ class PretrainTrainer:
         seismic: torch.Tensor,
         well_log: torch.Tensor,
         curve_mask: Optional[torch.Tensor],
+        well_mask: Optional[torch.Tensor],
+        value_mask: Optional[torch.Tensor],
     ):
         """Run frozen encoders without gradients."""
         with torch.no_grad():
@@ -271,6 +291,10 @@ class PretrainTrainer:
             well_kwargs = {"return_sequence": False}
             if curve_mask is not None:
                 well_kwargs["curve_mask"] = curve_mask
+            if well_mask is not None:
+                well_kwargs["mask"] = well_mask
+            if value_mask is not None:
+                well_kwargs["value_mask"] = value_mask
             well_global, _ = self.model.well_log_encoder(well_log, **well_kwargs)
         return seismic_global, well_global
 
@@ -279,8 +303,12 @@ class PretrainTrainer:
         seismic: torch.Tensor,
         well_log: torch.Tensor,
         curve_mask: Optional[torch.Tensor],
+        well_mask: Optional[torch.Tensor],
+        value_mask: Optional[torch.Tensor],
     ):
-        seis_global, well_global = self._encode_frozen(seismic, well_log, curve_mask)
+        seis_global, well_global = self._encode_frozen(
+            seismic, well_log, curve_mask, well_mask, value_mask
+        )
         seis_proj, well_proj = self.model.modality_proj(seis_global, well_global)
         fused = self.model.fusion_module(seis_proj, well_proj)
         return seis_proj, well_proj, fused
@@ -296,10 +324,12 @@ class PretrainTrainer:
         seismic: torch.Tensor,
         well_log: torch.Tensor,
         curve_mask: Optional[torch.Tensor],
+        well_mask: Optional[torch.Tensor],
+        value_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         with autocast(enabled=self.use_amp):
             seis_proj, well_proj, fused = self._fusion_forward(
-                seismic, well_log, curve_mask
+                seismic, well_log, curve_mask, well_mask, value_mask
             )
             z_fused = F.normalize(self.model.fusion_proj_head(fused), dim=-1)
             z_seis = F.normalize(self.model.seismic_proj_head(seis_proj), dim=-1)
@@ -314,21 +344,27 @@ class PretrainTrainer:
         seismic: torch.Tensor,
         well_log: torch.Tensor,
         curve_mask: Optional[torch.Tensor],
+        well_mask: Optional[torch.Tensor],
+        value_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         b = seismic.shape[0]
         with autocast(enabled=self.use_amp):
-            _, well_proj, fused = self._fusion_forward(seismic, well_log, curve_mask)
+            _, well_proj, fused = self._fusion_forward(
+                seismic, well_log, curve_mask, well_mask, value_mask
+            )
             pos_pairs = torch.cat([fused, well_proj], dim=-1)
             shuffle_idx = torch.randperm(b, device=self.device)
             neg_pairs = torch.cat([fused, well_proj[shuffle_idx]], dim=-1)
             pos_logits = self.model.matching_head(pos_pairs)
             neg_logits = self.model.matching_head(neg_pairs)
 
-        pos_loss = F.binary_cross_entropy(
+        # Use logits + BCEWithLogits: AMP fp16 Sigmoid outputs can leave [0, 1]
+        # and crash F.binary_cross_entropy with a device-side assert.
+        pos_loss = F.binary_cross_entropy_with_logits(
             pos_logits.float(),
             torch.ones(pos_logits.shape, device=pos_logits.device, dtype=torch.float32),
         )
-        neg_loss = F.binary_cross_entropy(
+        neg_loss = F.binary_cross_entropy_with_logits(
             neg_logits.float(),
             torch.zeros(neg_logits.shape, device=neg_logits.device, dtype=torch.float32),
         )
@@ -440,7 +476,18 @@ class PretrainTrainer:
             if val_metrics:
                 history["val"].append(val_metrics)
                 val_loss = val_metrics.get("total_loss", 0)
-                logger.info(f"  Val Total: {val_loss:.4f}")
+                if stage == 1:
+                    logger.info(
+                        f"  Val Total: {val_loss:.4f} | "
+                        f"MSM: {val_metrics.get('msm_loss', 0):.4f} | "
+                        f"MWM: {val_metrics.get('mwm_loss', 0):.4f}"
+                    )
+                else:
+                    logger.info(
+                        f"  Val Total: {val_loss:.4f} | "
+                        f"CMCL: {val_metrics.get('cmcl_loss', 0):.4f} | "
+                        f"SWM: {val_metrics.get('swm_loss', 0):.4f}"
+                    )
                 for k, v in val_metrics.items():
                     self.writer.add_scalar(
                         f"stage{stage}_val/{k}", v, self.global_step
