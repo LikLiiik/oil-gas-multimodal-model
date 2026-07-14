@@ -376,6 +376,8 @@ class PretrainTrainer:
 
     def train_epoch(self) -> Dict[str, float]:
         self.model.train()
+        if self._msm_decoder is not None:
+            self._msm_decoder.train()
         if self.training_stage == 2:
             self.model.seismic_encoder.eval()
             self.model.well_log_encoder.eval()
@@ -444,11 +446,14 @@ class PretrainTrainer:
             return {}
 
         self.model.eval()
+        if self._msm_decoder is not None:
+            self._msm_decoder.eval()
         metrics: Dict[str, float] = {}
-        for batch in self.val_loader:
-            losses = self.compute_pretrain_losses(batch)
-            for k, v in losses.items():
-                metrics[k] = metrics.get(k, 0.0) + v.item()
+        with torch.no_grad():
+            for batch in self.val_loader:
+                losses = self.compute_pretrain_losses(batch)
+                for k, v in losses.items():
+                    metrics[k] = metrics.get(k, 0.0) + v.item()
         n = len(self.val_loader)
         return {k: v / n for k, v in metrics.items()}
 

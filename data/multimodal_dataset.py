@@ -17,21 +17,38 @@ from .field_dataset import FieldDataset
 DEFAULT_FIELDS = ("volve", "rmotc", "penobscot")
 
 
+def _pooled_mean_std(
+    means: List[float], stds: List[float], weights: List[float]
+) -> Tuple[float, float]:
+    """Sample-weighted pooled mean / std across fields (not average of stds)."""
+    w = np.asarray(weights, dtype=np.float64)
+    m = np.asarray(means, dtype=np.float64)
+    s = np.asarray(stds, dtype=np.float64)
+    w_sum = float(w.sum())
+    if w_sum <= 0:
+        return 0.0, 1.0
+    mean = float(np.average(m, weights=w))
+    # E[X^2] = sum w_i (std_i^2 + mean_i^2) / sum w; Var = E[X^2] - mean^2
+    second = float(np.average(s * s + m * m, weights=w))
+    var = max(second - mean * mean, 0.0)
+    return mean, float(np.sqrt(var) + 1e-8)
+
+
 def merge_norm_stats(stats_list: List[Dict], well_curves: List[str]) -> Dict:
-    """Merge per-field normalization stats (weighted by sample count proxy)."""
+    """Merge per-field normalization stats (weighted by n_samples when present)."""
     merged: Dict = {"seismic_mean": 0.0, "seismic_std": 1.0}
     seis_means, seis_stds, weights = [], [], []
 
     for stats in stats_list:
-        w = 1.0
-        weights.append(w)
+        w = float(stats.get("n_samples", 1.0))
+        weights.append(max(w, 1.0))
         seis_means.append(stats.get("seismic_mean", 0.0))
         seis_stds.append(stats.get("seismic_std", 1.0))
 
     if weights:
-        w_arr = np.array(weights, dtype=np.float64)
-        merged["seismic_mean"] = float(np.average(seis_means, weights=w_arr))
-        merged["seismic_std"] = float(np.average(seis_stds, weights=w_arr)) + 1e-8
+        merged["seismic_mean"], merged["seismic_std"] = _pooled_mean_std(
+            seis_means, seis_stds, weights
+        )
 
     for curve in well_curves:
         means, stds, cw = [], [], []
@@ -40,10 +57,11 @@ def merge_norm_stats(stats_list: List[Dict], well_curves: List[str]) -> Dict:
             if key_m in stats and stats.get(key_s, 1.0) > 1e-6:
                 means.append(stats[key_m])
                 stds.append(stats[key_s])
-                cw.append(1.0)
+                cw.append(float(stats.get("n_samples", 1.0)))
         if means:
-            merged[f"{curve}_mean"] = float(np.mean(means))
-            merged[f"{curve}_std"] = float(np.mean(stds)) + 1e-8
+            merged[f"{curve}_mean"], merged[f"{curve}_std"] = _pooled_mean_std(
+                means, stds, cw
+            )
         else:
             merged[f"{curve}_mean"] = 0.0
             merged[f"{curve}_std"] = 1.0

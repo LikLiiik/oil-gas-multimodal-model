@@ -1012,9 +1012,12 @@ class NCSSeismicEncoder3D(nn.Module):
 
         visible_patches = self.encoder.norm(visible_patches)
 
-        # Mask
+        # Mask in shuffled order, then restore to original patch order
+        # (must match msm_task.py / standard MAE; without gather, loss hits
+        # fixed index ranges instead of the randomly masked patches).
         mask = torch.ones(B, N, device=x.device, dtype=torch.bool)
         mask[:, :len_keep] = False
+        mask = torch.gather(mask, dim=1, index=ids_restore)
 
         return visible_patches, mask, ids_restore
 

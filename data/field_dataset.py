@@ -192,6 +192,7 @@ class FieldDataset(Dataset):
             if patch is not None:
                 seismic_values.append(patch.flatten())
 
+        stats["n_samples"] = float(len(self.samples))
         if seismic_values:
             all_seis = np.concatenate(seismic_values)
             stats["seismic_mean"] = float(np.nanmean(all_seis))
