@@ -419,27 +419,16 @@ class MAEDecoder3D(nn.Module):
         N_total = ids_restore.shape[1]
         mask_tokens = self.mask_token.expand(B, N_total - N_vis, -1)
 
-        # Concatenate and restore order
+        # Concatenate and restore order.
+        # x_full is in shuffled order: position j holds the token whose original
+        # index is ids_shuffle[j]. Standard MAE unshuffle gathers with
+        # ids_restore (== ids_shuffle^{-1}) so that
+        #   x_reordered[i] = x_full[ids_restore[i]]  -> original position i.
+        # (Do NOT argsort(ids_restore) again: that yields ids_shuffle and
+        # scrambles the sequence, breaking the reconstruction loss.)
         x_full = torch.cat([x, mask_tokens], dim=1)  # (B, N_total, D)
-
-        # Scatter back to original positions
-        # ids_restore contains indices; we need to invert this mapping
-        # Create index tensor for scattering
-        ids_restore_expanded = ids_restore.unsqueeze(-1).expand(-1, -1, D)
-        # Actually, ids_restore tells us where each token goes
-        # x_full[i, ids_restore[i,j], :] = combined[i, j, :]
-        # Use scatter for efficient reordering
-        scatter_index = ids_restore.unsqueeze(-1).expand(-1, -1, D)
-        x_reordered = torch.zeros_like(x_full)
-        x_reordered = x_reordered.scatter(1, scatter_index, x_full)
-
-        # Simpler approach: use gather
-        # ids_restore maps: position in combined -> position in original
-        # We need inverse: position in original -> position in combined
-        # Let's compute inverse indices
-        inv_ids = torch.argsort(ids_restore, dim=1)  # (B, N_total)
-        inv_ids_expanded = inv_ids.unsqueeze(-1).expand(-1, -1, D)
-        x_reordered = torch.gather(x_full, 1, inv_ids_expanded)
+        restore_index = ids_restore.unsqueeze(-1).expand(-1, -1, D)
+        x_reordered = torch.gather(x_full, 1, restore_index)
 
         # Add position encoding
         x_reordered = self.decoder_pos_embed(x_reordered)

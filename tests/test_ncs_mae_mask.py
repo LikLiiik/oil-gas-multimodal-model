@@ -39,6 +39,55 @@ def test_forward_mae_encoder_mask_matches_ids_keep():
         assert mask[b, ids_shuffle[b, len_keep:]].all(), "dropped patches must be masked"
 
 
+def test_mae_decoder_unshuffle_restores_original_order():
+    """Decoder must map shuffled tokens back to ORIGINAL patch order.
+
+    Regression for the bug where argsort(ids_restore) (== ids_shuffle) was used
+    instead of ids_restore, scrambling reconstruction targets so MSM loss stalls.
+    """
+    torch.manual_seed(0)
+    B, N, D = 2, 8, 3
+    # Emulate the encoder's shuffle bookkeeping.
+    noise = torch.rand(B, N)
+    ids_shuffle = torch.argsort(noise, dim=1)
+    ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+    # x_full in shuffled order: token at shuffled slot j carries a tag equal to
+    # its ORIGINAL index (ids_shuffle[j]), so correct unshuffle yields 0..N-1.
+    tags = ids_shuffle.unsqueeze(-1).expand(-1, -1, D).float()
+
+    correct = torch.gather(tags, 1, ids_restore.unsqueeze(-1).expand(-1, -1, D))
+    expected = torch.arange(N).view(1, N, 1).expand(B, N, D).float()
+    assert torch.equal(correct, expected), "gather(ids_restore) must restore order"
+
+    # The old (buggy) inverse would re-apply the shuffle, NOT restore it.
+    inv = torch.argsort(ids_restore, dim=1)
+    assert torch.equal(inv, ids_shuffle)  # proves argsort(argsort(p)) == p
+    buggy = torch.gather(tags, 1, inv.unsqueeze(-1).expand(-1, -1, D))
+    assert not torch.equal(buggy, expected), "buggy path should scramble order"
+
+
+def test_forward_mae_loss_is_finite_and_trainable():
+    """End-to-end MSM step must produce a finite, backprop-able loss."""
+    from models.ncs_seismic_encoder import MAEDecoder3D
+
+    torch.manual_seed(0)
+    enc = NCSSeismicEncoder3D(
+        img_size=(16, 16, 16), patch_size=(4, 4, 4),
+        embed_dim=32, num_layers=2, num_heads=4, dropout=0.0,
+    )
+    dec = MAEDecoder3D(
+        encoder_embed_dim=32, decoder_embed_dim=32, patch_size=(4, 4, 4),
+        img_size=(16, 16, 16), decoder_num_heads=4, decoder_num_layers=2,
+    )
+    x = torch.randn(2, 1, 16, 16, 16)
+    out = enc.forward_mae(x, dec, mask_ratio=0.6)
+    assert torch.isfinite(out["loss"])
+    out["loss"].backward()
+    g = enc.patch_embed.proj.weight.grad
+    assert g is not None and torch.isfinite(g).all() and g.norm() > 0
+
+
 def test_merge_norm_stats_pooled_std():
     from data.multimodal_dataset import merge_norm_stats
 
@@ -94,6 +143,8 @@ def test_msm_skips_invalid_seismic():
 
 if __name__ == "__main__":
     test_forward_mae_encoder_mask_matches_ids_keep()
+    test_mae_decoder_unshuffle_restores_original_order()
+    test_forward_mae_loss_is_finite_and_trainable()
     test_merge_norm_stats_pooled_std()
     test_msm_skips_invalid_seismic()
     print("ok")
