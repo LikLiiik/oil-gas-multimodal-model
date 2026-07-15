@@ -90,6 +90,15 @@ class VectorQuantizer(nn.Module):
         # zero EMA cluster size.
         self.register_buffer("ema_w", torch.zeros_like(self.embedding.weight.data))
 
+        # When frozen (buffer so it survives checkpoint round-trips), the
+        # codebook stops moving: EMA updates and dead-code revival are skipped.
+        # This stabilizes the MTM classification targets after warmup so the
+        # cross-entropy loss stops chasing a drifting vocabulary.
+        self.register_buffer("codebook_frozen", torch.zeros(1, dtype=torch.bool))
+
+    def set_codebook_frozen(self, frozen: bool = True) -> None:
+        self.codebook_frozen.fill_(bool(frozen))
+
     def forward(
         self, z: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -126,8 +135,8 @@ class VectorQuantizer(nn.Module):
         # EMA already updates the codebook, so only β ||z - sg[e]||^2 is needed.
         commitment_loss = self.commitment_cost * F.mse_loss(z, z_q.detach())
 
-        # Update EMA buffers (only during training)
-        if self.training:
+        # Update EMA buffers (only during training, and only while unfrozen)
+        if self.training and not bool(self.codebook_frozen):
             with torch.no_grad():
                 # Update cluster sizes
                 encodings = F.one_hot(indices, self.num_embeddings).float()
@@ -148,7 +157,13 @@ class VectorQuantizer(nn.Module):
                         self.ema_w[active]
                         / self.ema_cluster_size[active].unsqueeze(1).clamp_min(1e-5)
                     )
-                    self.embedding.weight.data[active].copy_(embed_normalized)
+                    # NB: `weight.data[active].copy_(x)` writes to a temporary
+                    # advanced-indexing copy and is a silent no-op — the EMA
+                    # codebook never actually updated. Use masked index_copy /
+                    # direct assignment so the update lands on the parameter.
+                    self.embedding.weight.data[active] = embed_normalized.to(
+                        self.embedding.weight.data.dtype
+                    )
 
                 # Revive dead codes by reinitializing them from random encoder
                 # outputs. Without this the codebook collapses to a handful of
@@ -172,8 +187,9 @@ class VectorQuantizer(nn.Module):
                             dtype=embed_dtype,
                         )
                     )
-                    self.embedding.weight.data[dead].copy_(resurrected)
-                    self.ema_w.data[dead].copy_(resurrected)
+                    # Same masked-copy_ gotcha as above: assign, don't copy_.
+                    self.embedding.weight.data[dead] = resurrected
+                    self.ema_w.data[dead] = resurrected
                     self.ema_cluster_size.data[dead] = 1.0
 
         # VQ loss
@@ -363,6 +379,10 @@ class WellLogTokenizer(nn.Module):
     def get_codebook(self) -> torch.Tensor:
         """Return the full codebook."""
         return self.quantizer.embedding.weight  # (K, embed_dim)
+
+    def set_codebook_frozen(self, frozen: bool = True) -> None:
+        """Freeze/unfreeze the VQ codebook (stops EMA + dead-code revival)."""
+        self.quantizer.set_codebook_frozen(frozen)
 
 
 # ==============================================================================
@@ -1095,6 +1115,10 @@ class WLFMWellLogEncoder1D(nn.Module):
     def get_output_dim(self) -> int:
         """Return the output dimension."""
         return self.embed_dim
+
+    def set_codebook_frozen(self, frozen: bool = True) -> None:
+        """Freeze/unfreeze the VQ codebook so MTM targets stop drifting."""
+        self.tokenizer.set_codebook_frozen(frozen)
 
     def get_codebook(self) -> torch.Tensor:
         """Return the geological vocabulary codebook."""

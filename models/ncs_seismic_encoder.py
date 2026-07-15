@@ -1015,6 +1015,7 @@ class NCSSeismicEncoder3D(nn.Module):
         x: torch.Tensor,
         decoder: nn.Module,
         mask_ratio: float = 0.75,
+        norm_pix_loss: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Full MAE forward: encode visible patches and decode to reconstruct.
@@ -1023,6 +1024,12 @@ class NCSSeismicEncoder3D(nn.Module):
             x: (B, 1, D, H, W)
             decoder: MAEDecoder3D instance
             mask_ratio: Masking ratio
+            norm_pix_loss: If True, whiten each patch to unit variance before
+                computing the loss (original MAE). For 3D seismic this makes the
+                target dominated by intra-patch high-frequency noise (loss floors
+                near 1.0 and never drops). Default False: the dataset already
+                z-scores each field, so we reconstruct raw field-normalized
+                amplitudes whose low-frequency structure is actually learnable.
 
         Returns:
             dict with:
@@ -1036,11 +1043,13 @@ class NCSSeismicEncoder3D(nn.Module):
         # Compute target (original pixel values for each patch)
         target = self._patchify(x)  # (B, N, patch_dim)
 
-        # Per-patch normalization (MAE norm_pix_loss): makes MSM scale-invariant
-        # across fields / amplitude ranges so low-energy volumes don't dominate.
-        mean = target.mean(dim=-1, keepdim=True)
-        var = target.var(dim=-1, keepdim=True)
-        target = (target - mean) / (var + 1e-6).sqrt()
+        if norm_pix_loss:
+            # Per-patch whitening (original MAE norm_pix_loss). Kept optional
+            # because on small 3D seismic patches it removes the learnable
+            # low-frequency signal and leaves near-unpredictable noise.
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1e-6).sqrt()
 
         # Reconstruction loss (only on masked patches)
         loss = F.mse_loss(pred[mask], target[mask])

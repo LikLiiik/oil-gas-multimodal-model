@@ -184,22 +184,16 @@ class FieldDataset(Dataset):
 
     def _compute_norm_stats(self) -> Dict:
         stats: Dict = {}
-        seismic_values = []
-        for sample in self.samples[: min(500, len(self.samples))]:
-            patch = self._extract_seismic_patch(
-                sample["well_name"], sample["depth_start"], sample["depth_end"]
-            )
-            if patch is not None:
-                seismic_values.append(patch.flatten())
-
         stats["n_samples"] = float(len(self.samples))
-        if seismic_values:
-            all_seis = np.concatenate(seismic_values)
-            stats["seismic_mean"] = float(np.nanmean(all_seis))
-            stats["seismic_std"] = float(np.nanstd(all_seis)) + 1e-8
-        else:
-            stats["seismic_mean"] = 0.0
-            stats["seismic_std"] = 1.0
+
+        # Seismic stats are computed by sampling traces DIRECTLY from the volume
+        # (the same distribution MSM patches are drawn from), not from well-tie
+        # patches: for some fields (e.g. RMOTC) the near-well patches come back
+        # dead/constant, which collapsed seismic_std to ~1e-8 and blew normalized
+        # amplitudes up to 1e7. Non-dead traces only, robust-clipped.
+        mean, std = self._compute_seismic_stats_from_volume()
+        stats["seismic_mean"] = mean
+        stats["seismic_std"] = std
 
         for curve_name in self.well_curves:
             values = []
@@ -215,6 +209,47 @@ class FieldDataset(Dataset):
                 stats[f"{curve_name}_mean"] = 0.0
                 stats[f"{curve_name}_std"] = 1.0
         return stats
+
+    def _compute_seismic_stats_from_volume(
+        self, n_traces: int = 400, seed: int = 0
+    ) -> Tuple[float, float]:
+        """Robust per-field seismic mean/std from randomly sampled live traces.
+
+        Seismic amplitude scaling is arbitrary per survey, so each field must be
+        normalized on its own scale. We sample real traces, drop all-dead
+        (zero/near-constant) ones, and clip the central 99.8% before computing
+        mean/std so spikes / AGC edges don't inflate the std.
+        """
+        seis = self.seismic
+        keys = list(seis.trace_index.keys())
+        if not keys:
+            return 0.0, 1.0
+        rng = np.random.RandomState(seed)
+        pick = rng.choice(len(keys), size=min(n_traces, len(keys)), replace=False)
+
+        vals: List[np.ndarray] = []
+        for j in pick:
+            il, xl = keys[int(j)]
+            try:
+                v = seis.read_volume(il_range=(il, il + 1), xl_range=(xl, xl + 1))
+            except Exception:
+                continue
+            if v is None or v.size == 0:
+                continue
+            v = v.flatten()
+            v = v[np.isfinite(v)]
+            # Skip dead traces (all-zero / near-constant) so they don't pull the
+            # mean/std toward zero.
+            if v.size == 0 or float(v.std()) < 1e-6:
+                continue
+            vals.append(v)
+
+        if not vals:
+            return 0.0, 1.0
+        all_seis = np.concatenate(vals)
+        lo, hi = np.percentile(all_seis, [0.1, 99.9])
+        clipped = np.clip(all_seis, lo, hi)
+        return float(clipped.mean()), float(clipped.std()) + 1e-8
 
     def _extract_seismic_patch(
         self, well_name: str, depth_start: int, depth_end: int

@@ -113,8 +113,22 @@ class CombinedMultimodalDataset(Dataset):
                 norm_stats = merge_norm_stats(per_field_stats, curves)
 
         self.norm_stats = norm_stats
+        # Well-curve stats are pooled across fields (physical units are
+        # comparable), but seismic amplitude scaling is arbitrary per survey
+        # (e.g. AGC vs raw). Pooling seismic into one global std lets the
+        # highest-amplitude field dominate and crushes the others to near-zero
+        # variance, starving MSM of signal. So keep each field's OWN seismic
+        # mean/std and only overlay the shared curve stats.
         for ds in self.field_datasets.values():
-            ds.norm_stats = self.norm_stats
+            field_stats = dict(self.norm_stats)
+            if ds.norm_stats is not None:
+                field_stats["seismic_mean"] = ds.norm_stats.get(
+                    "seismic_mean", self.norm_stats["seismic_mean"]
+                )
+                field_stats["seismic_std"] = ds.norm_stats.get(
+                    "seismic_std", self.norm_stats["seismic_std"]
+                )
+            ds.norm_stats = field_stats
 
         self.samples: List[Tuple[str, int]] = []
         for field, ds in self.field_datasets.items():
@@ -174,6 +188,9 @@ class CombinedMultimodalDataset(Dataset):
         val_parts = {}
         for field in fields:
             ref = train_parts[field]
+            # ref.norm_stats now carries pooled curve stats + this field's OWN
+            # seismic mean/std (set during train_ds construction). Reuse it so
+            # val seismic is normalized on the same per-field scale as train.
             val_parts[field] = FieldDataset(
                 project_root=project_root,
                 field=field,
@@ -183,7 +200,7 @@ class CombinedMultimodalDataset(Dataset):
                 well_curves=well_curves,
                 train_wells=ref.train_wells,
                 val_wells=ref.val_wells,
-                norm_stats=norm_stats,
+                norm_stats=ref.norm_stats,
                 require_verified_geometry=require_verified_geometry,
             )
 

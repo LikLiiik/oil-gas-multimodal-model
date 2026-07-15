@@ -169,6 +169,13 @@ def main():
         "early_stopping": 15,
         "stage1_weights": {"msm": 1.0, "mwm": 1.0},
         "stage2_weights": {"cmcl": 0.5, "swm": 0.3},
+        # MSM: predict raw field-normalized amplitudes (per-patch whitening
+        # floors the loss near 1.0 on 3D seismic and never drops).
+        "msm_norm_pix_loss": False,
+        # MWM: VQ commitment weight, and epoch to freeze codebook so MTM
+        # classification targets stop drifting (default = warmup_epochs).
+        "mwm_vq_weight": 1.0,
+        "mwm_codebook_freeze_epoch": 5,
     }
 
     trainer = PretrainTrainer(

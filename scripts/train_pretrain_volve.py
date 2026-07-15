@@ -84,6 +84,7 @@ class PretrainTrainer:
         self.current_epoch = 0
         self.training_stage = 1
         self._msm_decoder: Optional[nn.Module] = None
+        self._codebook_frozen = False
 
     @property
     def stage1_split(self) -> bool:
@@ -130,6 +131,23 @@ class PretrainTrainer:
             self.model.matching_head,
         ]
         return [p for m in modules for p in m.parameters() if p.requires_grad]
+
+    def _maybe_freeze_codebook(self, epoch: int) -> None:
+        """Freeze the VQ codebook once warmup is done so MTM targets stop
+        drifting. Config key `mwm_codebook_freeze_epoch` (default = warmup)."""
+        wl_encoder = self.model.well_log_encoder
+        if not hasattr(wl_encoder, "set_codebook_frozen"):
+            return
+        freeze_epoch = self.config.get(
+            "mwm_codebook_freeze_epoch", self.config.get("warmup_epochs", 5)
+        )
+        if freeze_epoch is None or freeze_epoch < 0:
+            return  # never freeze
+        should_freeze = epoch >= freeze_epoch
+        if should_freeze and not getattr(self, "_codebook_frozen", False):
+            wl_encoder.set_codebook_frozen(True)
+            self._codebook_frozen = True
+            logger.info(f"Froze VQ codebook at epoch {epoch} (MTM targets fixed)")
 
     def _freeze_encoders(self) -> None:
         for module in (self.model.seismic_encoder, self.model.well_log_encoder):
@@ -235,7 +253,7 @@ class PretrainTrainer:
         seismic_valid = tensors.get("seismic_valid")
 
         msm_loss, msm_active = self._compute_msm_loss(seismic, seismic_valid)
-        mwm_loss = self._compute_mwm_loss(
+        mwm_loss, mtm_loss, vq_loss = self._compute_mwm_loss(
             well_log, curve_mask, well_mask, value_mask
         )
 
@@ -249,6 +267,8 @@ class PretrainTrainer:
             "total_loss": total,
             "msm_loss": msm_loss.detach() if not msm_active else msm_loss,
             "mwm_loss": mwm_loss,
+            "mtm_loss": mtm_loss,
+            "vq_loss": vq_loss,
             "msm_active": torch.tensor(
                 1.0 if msm_active else 0.0, device=self.device
             ),
@@ -266,7 +286,7 @@ class PretrainTrainer:
         msm_loss, msm_active = self._compute_msm_loss(
             msm_tensors["seismic"], msm_tensors.get("seismic_valid")
         )
-        mwm_loss = self._compute_mwm_loss(
+        mwm_loss, mtm_loss, vq_loss = self._compute_mwm_loss(
             well_tensors["well_log"],
             well_tensors.get("curve_mask"),
             well_tensors.get("well_mask"),
@@ -282,6 +302,8 @@ class PretrainTrainer:
             "total_loss": total,
             "msm_loss": msm_loss.detach() if not msm_active else msm_loss,
             "mwm_loss": mwm_loss,
+            "mtm_loss": mtm_loss,
+            "vq_loss": vq_loss,
             "msm_active": torch.tensor(
                 1.0 if msm_active else 0.0, device=self.device
             ),
@@ -345,7 +367,10 @@ class PretrainTrainer:
         if hasattr(seis_encoder, "forward_mae"):
             self._ensure_msm_decoder()
             result = seis_encoder.forward_mae(
-                seismic_v, self._msm_decoder, mask_ratio=0.6
+                seismic_v,
+                self._msm_decoder,
+                mask_ratio=0.6,
+                norm_pix_loss=self.config.get("msm_norm_pix_loss", False),
             )
             return result["loss"], True
 
@@ -361,7 +386,8 @@ class PretrainTrainer:
         curve_mask: Optional[torch.Tensor],
         well_mask: Optional[torch.Tensor],
         value_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ):
+        """Returns (mwm_total, mtm_loss, vq_loss). mwm_total is what's optimized."""
         wl_encoder = self.model.well_log_encoder
         if hasattr(wl_encoder, "forward_mtm"):
             with autocast(enabled=self.use_amp):
@@ -372,8 +398,20 @@ class PretrainTrainer:
                     depth_mask=well_mask,
                     value_mask=value_mask,
                 )
-                return result["loss"]
-        return torch.tensor(0.0, device=self.device, requires_grad=True)
+            # Prefer the split losses; fall back to combined "loss" if a
+            # minimal encoder only returns that (vq folded into mtm then).
+            if "mtm_loss" in result and "vq_loss" in result:
+                mtm_loss = result["mtm_loss"]
+                vq_loss = result["vq_loss"]
+                vq_w = self.config.get("mwm_vq_weight", 1.0)
+                mwm_total = mtm_loss + vq_w * vq_loss
+            else:
+                mwm_total = result["loss"]
+                mtm_loss = mwm_total
+                vq_loss = torch.zeros((), device=self.device)
+            return mwm_total, mtm_loss.detach(), vq_loss.detach()
+        zero = torch.tensor(0.0, device=self.device, requires_grad=True)
+        return zero, zero.detach(), zero.detach()
 
     def _encode_frozen(
         self,
@@ -538,7 +576,8 @@ class PretrainTrainer:
                         f"Batch {batch_idx}/{num_batches} | "
                         f"Total: {loss.item()*accum:.4f} | "
                         f"MSM: {losses['msm_loss'].item():.4f} | "
-                        f"MWM: {losses['mwm_loss'].item():.4f} | "
+                        f"MTM: {losses.get('mtm_loss', torch.tensor(0.0)).item():.4f} | "
+                        f"VQ: {losses.get('vq_loss', torch.tensor(0.0)).item():.4f} | "
                         f"seis_ok: {int(losses.get('msm_active', torch.tensor(1.0)).item())} | "
                         f"LR: {lr:.6f}"
                     )
@@ -631,6 +670,8 @@ class PretrainTrainer:
 
         for epoch in range(epochs):
             self.current_epoch = epoch
+            if stage == 1:
+                self._maybe_freeze_codebook(epoch)
             t0 = time.time()
             train_metrics = self.train_epoch()
             train_metrics["time"] = time.time() - t0
@@ -650,7 +691,8 @@ class PretrainTrainer:
                     logger.info(
                         f"  Val Total: {val_loss:.4f} | "
                         f"MSM: {val_metrics.get('msm_loss', 0):.4f} | "
-                        f"MWM: {val_metrics.get('mwm_loss', 0):.4f} | "
+                        f"MTM: {val_metrics.get('mtm_loss', 0):.4f} | "
+                        f"VQ: {val_metrics.get('vq_loss', 0):.4f} | "
                         f"seis_frac: {val_metrics.get('msm_valid_frac', 0):.2f}"
                     )
                 else:
@@ -822,6 +864,9 @@ def main():
         "early_stopping": 15,
         "stage1_weights": {"msm": 1.0, "mwm": 1.0},
         "stage2_weights": {"cmcl": 0.5, "swm": 0.3},
+        "msm_norm_pix_loss": False,
+        "mwm_vq_weight": 1.0,
+        "mwm_codebook_freeze_epoch": 5,
     }
 
     trainer = PretrainTrainer(
